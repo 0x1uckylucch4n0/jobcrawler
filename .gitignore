@@ -1,0 +1,21 @@
+# Credentials & personal data — NEVER commit these
+workspace/service_account.json
+workspace/CV.pdf
+workspace/CV.md
+workspace/COVER_LETTER.md
+workspace/APPLICATION_ANSWERS.md
+workspace/screening_answers.json
+
+# Browser profiles
+linkedin-profile/
+company-profile/
+
+# Logs & runtime
+runner.log
+*.log
+*.pid
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

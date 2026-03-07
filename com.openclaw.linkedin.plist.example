@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openclaw.linkedin</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/aly4x/.pyenv/versions/3.11.9/bin/python3</string>
+        <string>/Users/aly4x/openclaw/apply/linkedin_runner.py</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/aly4x/openclaw/apply/runner.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/aly4x/openclaw/apply/runner.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/aly4x/.pyenv/versions/3.11.9/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/aly4x</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
