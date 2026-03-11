@@ -5,8 +5,9 @@ company application form, and applies using Claude Opus vision + structured
 page-level field extraction.
 """
 
-import json, os, re, time, base64, requests, imaplib, email as email_lib
+import json, os, re, time, base64, requests, imaplib, email as email_lib, yaml
 from datetime import datetime
+from pathlib import Path
 import gspread
 from google.oauth2.service_account import Credentials
 import anthropic
@@ -48,7 +49,7 @@ PROFILE = {
     "county": "Greater London",
     "current_role": "Technology Risk Consultant at EY Financial Services",
     "experience_years": "2",
-    "education": "BSc Political Economy, King's College London (2020-2023)",
+    "education": "BSc (Hons) Political Economy (2:1), King's College London (2020-2023)",
     "visa_sponsorship": "Yes",
     "notice_period": "2 weeks",
     "salary_expectation": "52000",
@@ -87,6 +88,199 @@ def tg(msg):
         )
     except Exception:
         pass
+
+def tg_photo(photo_bytes, caption=""):
+    """Send a photo to Telegram (for CAPTCHA screenshots)."""
+    if not TG_TOKEN or not TG_CHAT:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
+            data={"chat_id": TG_CHAT, "caption": caption[:1024]},
+            files={"photo": ("captcha.png", photo_bytes, "image/png")},
+            timeout=15,
+        )
+    except Exception:
+        pass
+
+def tg_poll_reply(prompt_msg, timeout=300):
+    """Send a message to Telegram and wait for a reply (for CAPTCHA solving).
+    Returns the reply text or None if timeout."""
+    if not TG_TOKEN or not TG_CHAT:
+        return None
+    try:
+        # Get current update_id to only look at new messages
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
+            params={"offset": -1, "limit": 1}, timeout=10,
+        )
+        data = resp.json()
+        last_id = 0
+        if data.get("result"):
+            last_id = data["result"][-1]["update_id"]
+
+        # Poll for reply
+        start = time.time()
+        while time.time() - start < timeout:
+            time.sleep(5)
+            resp = requests.get(
+                f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
+                params={"offset": last_id + 1, "limit": 10}, timeout=10,
+            )
+            data = resp.json()
+            for update in data.get("result", []):
+                msg = update.get("message", {})
+                if str(msg.get("chat", {}).get("id")) == str(TG_CHAT):
+                    text = msg.get("text", "").strip()
+                    if text:
+                        # Acknowledge
+                        last_id = update["update_id"]
+                        return text
+        return None
+    except Exception as e:
+        log(f"  tg_poll error: {e}")
+        return None
+
+
+# -- Answer Cache -------------------------------------------------------------
+ANSWER_CACHE_PATH = os.path.expanduser("~/openclaw/apply/answer_cache.yaml")
+
+def _load_answer_cache():
+    """Load cached answers from YAML file."""
+    try:
+        if os.path.exists(ANSWER_CACHE_PATH):
+            with open(ANSWER_CACHE_PATH) as f:
+                return yaml.safe_load(f) or {}
+    except Exception:
+        pass
+    return {}
+
+def _save_answer_cache(cache):
+    """Save answer cache to YAML file."""
+    try:
+        os.makedirs(os.path.dirname(ANSWER_CACHE_PATH), exist_ok=True)
+        with open(ANSWER_CACHE_PATH, "w") as f:
+            yaml.dump(cache, f, default_flow_style=False, allow_unicode=True)
+    except Exception as e:
+        log(f"  cache save error: {e}")
+
+def _cache_key(label):
+    """Normalize a field label into a cache key."""
+    if not label:
+        return ""
+    # Lowercase, strip whitespace, remove special chars
+    key = re.sub(r'[^a-z0-9 ]', '', label.lower().strip())
+    key = re.sub(r'\s+', ' ', key).strip()
+    return key
+
+def cache_answers(fields, actions):
+    """Cache successful fill/select/radio answers by question label."""
+    cache = _load_answer_cache()
+    # Build a map of selector -> action for quick lookup
+    action_map = {}
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        sel = a.get("selector", "")
+        if sel:
+            action_map[sel] = a
+
+    for f in fields:
+        label = f.get("label", "")
+        key = _cache_key(label)
+        if not key or len(key) < 5:
+            continue
+        # Find matching action
+        fid = f.get("id", "")
+        fname = f.get("name", "")
+        matched_action = None
+        for sel, a in action_map.items():
+            if (fid and fid in sel) or (fname and fname in sel) or (label and label in sel):
+                matched_action = a
+                break
+        if not matched_action:
+            continue
+        value = matched_action.get("value", matched_action.get("pick", ""))
+        if value and len(value) > 0:
+            cache[key] = {
+                "value": value,
+                "action": matched_action.get("action", "fill"),
+                "label": label,
+            }
+    _save_answer_cache(cache)
+
+def get_cached_answers(fields):
+    """Look up cached answers for fields. Returns list of actions from cache."""
+    cache = _load_answer_cache()
+    if not cache:
+        return []
+    cached_actions = []
+    for f in fields:
+        label = f.get("label", "")
+        key = _cache_key(label)
+        if not key or key not in cache:
+            continue
+        # Skip if field already has a value
+        if f.get("value") and len(f["value"].strip()) > 1:
+            continue
+        entry = cache[key]
+        fid = f.get("id", "")
+        selector = f"[id=\"{fid}\"]" if fid else f.get("selector", label)
+        cached_actions.append({
+            "action": entry.get("action", "fill"),
+            "selector": selector,
+            "value": entry["value"],
+            "_cached": True,
+        })
+        log(f"    cache hit: '{label[:40]}' = '{entry['value'][:30]}'")
+    return cached_actions
+
+
+# -- Application History (dedup) ----------------------------------------------
+HISTORY_PATH = os.path.expanduser("~/openclaw/apply/application_history.yaml")
+
+def _load_history():
+    try:
+        if os.path.exists(HISTORY_PATH):
+            with open(HISTORY_PATH) as f:
+                return yaml.safe_load(f) or {}
+    except Exception:
+        pass
+    return {}
+
+def _save_history(history):
+    try:
+        os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
+        with open(HISTORY_PATH, "w") as f:
+            yaml.dump(history, f, default_flow_style=False, allow_unicode=True)
+    except Exception:
+        pass
+
+def _history_key(company, role):
+    """Create a dedup key from company + role."""
+    c = re.sub(r'[^a-z0-9]', '', company.lower())
+    r = re.sub(r'[^a-z0-9]', '', role.lower())[:60]
+    return f"{c}:{r}"
+
+def was_already_applied(company, role):
+    """Check if we already applied to this company/role combo."""
+    h = _load_history()
+    key = _history_key(company, role)
+    return key in h
+
+def record_application(company, role, success, reason=""):
+    """Record an application attempt."""
+    h = _load_history()
+    key = _history_key(company, role)
+    h[key] = {
+        "company": company,
+        "role": role[:80],
+        "success": success,
+        "reason": reason[:100],
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    _save_history(h)
+
 
 # -- Sheet helpers ------------------------------------------------------------
 def get_sheet():
@@ -394,7 +588,7 @@ RULES:
 - For phone number fields: use "7760289275" (no country code prefix -- it's usually a separate dropdown).
 - For "How did you hear about us" / source fields: pick "Job Posting", "Online", "LinkedIn", or the simplest available option. Never pick "Employee Referral".
 - For yes/no questions: answer based on the applicant profile (sponsorship=Yes, over 18=Yes, former employee=No, criminal record=No, etc.)
-- For open text / cover letter / "why this role" fields: write 2-3 professional sentences referencing the applicant's background.
+- For open text / cover letter / "why this role" fields: write 2-3 professional sentences referencing the applicant's ACTUAL CV experience and tailored to the specific job description provided. Mention relevant projects, skills, and achievements from the CV. Never fabricate experience or skills not in the CV.
 - For ethnicity/race questions: ALWAYS pick "I prefer not to answer" or "Prefer not to say". Never guess ethnicity.
 - For disability/communities questions: ALWAYS pick "I prefer not to answer" or "None of the above".
 - If you see a "Discard Application?" / "Leave?" dialog: return a click action on "Continue" or "Cancel" to stay.
@@ -410,7 +604,7 @@ If there are no fields to fill (page is already complete or is a non-form page):
 """
 
 
-def build_system_prompt(role, company, ws_profile):
+def build_system_prompt(role, company, ws_profile, job_description=""):
     profile_summary = (
         f"Name: {PROFILE['first_name']} {PROFILE['last_name']}\n"
         f"Applying for: {role} at {company}\n"
@@ -424,9 +618,11 @@ def build_system_prompt(role, company, ws_profile):
     answers_text = ws_profile.get("answers", "")
     extra = ""
     if cv_text:
-        extra += f"\n\nCV SUMMARY:\n{cv_text[:3000]}"
+        extra += f"\n\nFULL CV:\n{cv_text[:4000]}"
     if answers_text:
-        extra += f"\n\nPRE-WRITTEN ANSWERS:\n{answers_text[:2000]}"
+        extra += f"\n\nPRE-WRITTEN ANSWERS (adapt these to the question, don't copy verbatim):\n{answers_text[:3000]}"
+    if job_description:
+        extra += f"\n\nJOB DESCRIPTION (use this to tailor 'why this role' and cover letter answers):\n{job_description[:2000]}"
 
     return SYSTEM_PROMPT.format(
         profile_summary=profile_summary + extra,
@@ -1840,6 +2036,65 @@ def _auto_fill_workday_dropdowns(page):
         log(f"    workday-dropdown error: {e}")
 
 
+def _handle_captcha_via_telegram(page, company, role):
+    """Screenshot the CAPTCHA, send to Telegram, wait for human to solve it on the page.
+    The human should solve it directly in the browser (which is visible on her screen).
+    We just wait and check if the CAPTCHA disappeared."""
+    try:
+        screenshot = page.screenshot(full_page=False)
+        tg_photo(
+            screenshot,
+            caption=f"CAPTCHA detected!\n{role} @ {company}\n\nPlease solve it in the browser window. I'll wait up to 5 minutes.",
+        )
+        tg(f"Waiting for you to solve the CAPTCHA in the browser...")
+
+        # Wait up to 5 minutes, checking every 10 seconds if CAPTCHA is gone
+        for i in range(30):
+            time.sleep(10)
+            try:
+                vis = page.evaluate("() => document.body.innerText.toLowerCase().slice(0, 2000)")
+                if not any(x in vis for x in ["captcha", "verify you are human", "i'm not a robot", "recaptcha"]):
+                    tg(f"CAPTCHA solved! Continuing with {company}...")
+                    return True
+            except Exception:
+                pass
+        tg(f"CAPTCHA timeout for {company} — skipping")
+        return False
+    except Exception as e:
+        log(f"  captcha-tg error: {e}")
+        return False
+
+
+def _scrape_job_description(page):
+    """Extract the job description text from the current page (for tailored answers)."""
+    try:
+        return page.evaluate("""() => {
+            // Try common job description containers
+            const selectors = [
+                '[class*="job-description"]', '[class*="jobDescription"]',
+                '[class*="description"]', '[data-automation-id="jobPostingDescription"]',
+                'article', '[class*="posting-page"]', '[class*="content-wrapper"]',
+                '.job-details', '#job-details', '.description',
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el && el.innerText.trim().length > 200) {
+                    return el.innerText.trim().slice(0, 3000);
+                }
+            }
+            // Fallback: get the longest text block on the page
+            const divs = [...document.querySelectorAll('div,section')];
+            let best = '';
+            for (const d of divs) {
+                const t = d.innerText.trim();
+                if (t.length > best.length && t.length < 5000) best = t;
+            }
+            return best.slice(0, 3000);
+        }""")
+    except Exception:
+        return ""
+
+
 def apply_company(page, url, role, company, ws_profile, client):
     """Apply to a single job. Returns (success: bool, reason: str)."""
     # Resolve company URL from LinkedIn if needed
@@ -1881,7 +2136,14 @@ def apply_company(page, url, role, company, ws_profile, client):
         page_text_lower = page.evaluate("() => document.body.innerText.toLowerCase().slice(0, 3000)")
         page_url_lower = page.url.lower()
         if any(x in page_text_lower for x in ["captcha", "verify you are human", "i'm not a robot", "recaptcha"]):
-            return False, "CAPTCHA detected on landing page"
+            if TG_TOKEN and TG_CHAT:
+                solved = _handle_captcha_via_telegram(page, company, role)
+                if solved:
+                    log("  CAPTCHA solved via Telegram, continuing...")
+                else:
+                    return False, "CAPTCHA detected — Telegram solve timed out"
+            else:
+                return False, "CAPTCHA detected on landing page"
         if any(x in page_text_lower for x in ["access denied", "403 forbidden", "you have been blocked"]):
             return False, "blocked/access denied"
         # SuccessFactors: requires account creation with CAPTCHA (can't automate)
@@ -1899,7 +2161,12 @@ def apply_company(page, url, role, company, ws_profile, client):
     except Exception:
         pass
 
-    system = build_system_prompt(role, company, ws_profile)
+    # Scrape job description from the landing page (before form navigation)
+    job_desc = _scrape_job_description(page)
+    if job_desc:
+        log(f"  Scraped job description ({len(job_desc)} chars)")
+
+    system = build_system_prompt(role, company, ws_profile, job_description=job_desc)
     context = page.context
     stuck_count = 0
     prev_url = ""
@@ -1916,6 +2183,11 @@ def apply_company(page, url, role, company, ws_profile, client):
         try:
             vis_text = page.evaluate("() => document.body.innerText.toLowerCase().slice(0, 2000)")
             if "captcha" in vis_text or "recaptcha" in vis_text or "verify you are human" in vis_text:
+                if TG_TOKEN and TG_CHAT:
+                    solved = _handle_captcha_via_telegram(page, company, role)
+                    if solved:
+                        log("  CAPTCHA solved via Telegram, continuing...")
+                        continue
                 return False, "CAPTCHA on form page"
             if "verification code" in vis_text and "email" in vis_text and "enter" in vis_text:
                 if GMAIL_APP_PASSWORD and handle_email_verification(page):
@@ -1943,7 +2215,16 @@ def apply_company(page, url, role, company, ws_profile, client):
         fields = extract_page_fields(page)
         log(f"  Found {len(fields)} fields")
 
-        # Ask Claude to analyze page and return all actions
+        # Step 1: Apply cached answers first (saves Claude API calls)
+        cached = get_cached_answers(fields)
+        if cached:
+            log(f"  Applying {len(cached)} cached answers")
+            execute_actions(page, cached)
+            time.sleep(0.5)
+            # Re-extract fields to see what's left
+            fields = extract_page_fields(page)
+
+        # Step 2: Ask Claude to analyze page and return actions for remaining fields
         actions = analyze_page(client, page, fields, system, role, company)
         log(f"  Claude returned {len(actions)} actions")
 
@@ -1961,6 +2242,12 @@ def apply_company(page, url, role, company, ws_profile, client):
                 return True, "submitted"
             if isinstance(result, str) and result.startswith("SKIP:"):
                 return False, result[5:].strip()
+
+            # Step 3: Cache successful answers for future applications
+            try:
+                cache_answers(fields, actions)
+            except Exception:
+                pass
         time.sleep(1)
 
         # Quick re-fill pass: React sometimes clears fields during re-render.
@@ -2355,6 +2642,11 @@ def main():
             log(f"URL: {url}")
             log(f"{'~'*50}")
 
+            # Skip if already applied (dedup)
+            if was_already_applied(company, title):
+                log(f"  SKIPPED: already applied to this role")
+                continue
+
             # Close stray tabs
             try:
                 for extra in ctx.pages:
@@ -2368,6 +2660,9 @@ def main():
             except Exception as e:
                 ok, reason = False, str(e)[:200]
                 log(f"  Exception: {e}")
+
+            # Record in history
+            record_application(company, title, ok, reason)
 
             if ok:
                 sheet.update_cell(row_idx, COL_STATUS, "Applied")
