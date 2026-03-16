@@ -27,9 +27,7 @@ COL_STATUS      = 6  # Column F
 # ── Logging ──────────────────────────────────────────────────────────────────────
 def log(msg):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
-    print(line)
-    with open(LOG_FILE, "a") as f:
-        f.write(line + "\n")
+    print(line, flush=True)
 
 def tg(msg):
     try:
@@ -305,12 +303,25 @@ def main():
     headers = rows[0] if rows else []
     applied_idx = next((i for i,h in enumerate(headers) if h.lower() in ("applied","claude")), 5)
 
+    # Build set of URLs already applied to anywhere in the sheet
+    applied_urls = set()
+    for row in rows[1:]:
+        while len(row) <= applied_idx: row.append("")
+        status = row[applied_idx].strip()
+        if "applied" in status.lower():
+            u = extract_url(row[0])
+            if u:
+                applied_urls.add(u.strip())
+
     pending = []
     for i, row in enumerate(rows[1:], start=2):
         while len(row) <= applied_idx: row.append("")
         if not row[applied_idx].strip():
             url = extract_url(row[0])
             if "linkedin.com" in url.lower():
+                if url.strip() in applied_urls:
+                    log(f"  Skipping (already applied): {extract_title(row[0])}")
+                    continue
                 pending.append((i, url, extract_title(row[0]), row[1] if len(row)>1 else ""))
 
     log(f"Found {len(pending)} pending LinkedIn jobs")
@@ -336,7 +347,19 @@ def main():
         page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
         time.sleep(3)
         if "login" in page.url or "authwall" in page.url:
-            log("Not logged in — please log in and press Enter"); input()
+            log("Not logged in — LinkedIn session expired.")
+            # Only alert once per expiry (flag file cleared when session restored)
+            flag = os.path.join(os.path.dirname(__file__), ".session_expired")
+            if not os.path.exists(flag):
+                open(flag, "w").close()
+                tg("⚠️ *LinkedIn session expired* — OpenClaw paused. Please log back into LinkedIn in the Chromium profile and I'll resume automatically.")
+            ctx.close()
+            return
+        else:
+            # Session is valid — clear the flag so we notify again next time it expires
+            flag = os.path.join(os.path.dirname(__file__), ".session_expired")
+            if os.path.exists(flag):
+                os.remove(flag)
 
         for row_idx, url, title, company in pending:
             log(f"\n→ {title} @ {company}\n  {url}")

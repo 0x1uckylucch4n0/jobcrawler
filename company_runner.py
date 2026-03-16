@@ -8,7 +8,10 @@ page-level field extraction.
 import json, os, re, time, base64, requests, imaplib, email as email_lib, yaml
 from datetime import datetime
 from pathlib import Path
+from dotenv import load_dotenv
 import gspread
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 from google.oauth2.service_account import Credentials
 import anthropic
 from playwright.sync_api import sync_playwright
@@ -29,9 +32,11 @@ TG_TOKEN        = os.environ.get("TG_TOKEN", "")
 TG_CHAT         = os.environ.get("TG_CHAT", "")
 # Gmail password for reading verification codes (Oracle HCM, etc.)
 LOG_FILE        = os.path.expanduser("~/openclaw/apply/runner.log")
+WORKDAY_DEFAULT_PASSWORD = os.environ.get("WORKDAY_DEFAULT_PASSWORD", "")  # Standard password for all new Workday accounts
+_workday_passwords = {}  # domain → password used (populated during account creation)
 COL_STATUS      = 6  # Column F
 
-MAX_PAGES       = 12   # max pages per application (most forms are 3-6 pages)
+MAX_PAGES       = 25   # max pages per application (Workday multi-page forms can be 15+ pages)
 MAX_RETRIES     = 2    # error-fix retries per page
 MAX_STUCK       = 2    # pages with zero progress before giving up
 
@@ -51,6 +56,7 @@ PROFILE = {
     "experience_years": "2",
     "education": "BSc (Hons) Political Economy (2:1), King's College London (2020-2023)",
     "visa_sponsorship": "Yes",
+    "right_to_work_uk": "No - requires Skilled Worker visa sponsorship from the new employer",
     "notice_period": "2 weeks",
     "salary_expectation": "52000",
     "gender": "Female",
@@ -60,13 +66,18 @@ PROFILE = {
     "criminal_record": "No",
     "former_employee": "No",
     "over_18": "Yes",
-    "authorized_to_work": "Yes",
+    "authorized_to_work": "No",
     "languages": "English (Fluent), Russian (Fluent), Kazakh (Fluent), French (Intermediate), Spanish (Beginner)",
     "linkedin": "https://www.linkedin.com/in/alramina-myrzabekova",
     "hear_about_us": "Job Posting",
 }
 
 # -- Logging ------------------------------------------------------------------
+def is_workday_url(url):
+    """Return True if URL is a Workday ATS page (any tenant)."""
+    return "myworkdayjobs.com" in url or "myworkdaysite.com" in url
+
+
 def log(msg):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
     print(line)
@@ -226,8 +237,13 @@ def get_cached_answers(fields):
         entry = cache[key]
         fid = f.get("id", "")
         selector = f"[id=\"{fid}\"]" if fid else f.get("selector", label)
+        field_type = f.get("type", "")
+        cached_action = entry.get("action", "fill")
+        # Don't apply a custom_dropdown action to a plain text/tel/number input
+        if cached_action == "custom_dropdown" and field_type in ("text", "tel", "number", "email", "textarea"):
+            continue
         cached_actions.append({
-            "action": entry.get("action", "fill"),
+            "action": cached_action,
             "selector": selector,
             "value": entry["value"],
             "_cached": True,
@@ -263,10 +279,22 @@ def _history_key(company, role):
     return f"{c}:{r}"
 
 def was_already_applied(company, role):
-    """Check if we already applied to this company/role combo."""
+    """Check if we already applied to this company/role combo.
+    Exact key match first, then fuzzy: checks if role matches any entry for a
+    company whose normalised name contains or is contained by this company name."""
     h = _load_history()
     key = _history_key(company, role)
-    return key in h
+    if key in h:
+        return True
+    # Fuzzy: normalised role must match exactly; company name just needs to overlap
+    c_norm = re.sub(r'[^a-z0-9]', '', company.lower())
+    r_norm = re.sub(r'[^a-z0-9]', '', role.lower())[:60]
+    for existing_key, entry in h.items():
+        ec = re.sub(r'[^a-z0-9]', '', entry.get("company", "").lower())
+        er = re.sub(r'[^a-z0-9]', '', entry.get("role", "").lower())[:60]
+        if er == r_norm and (c_norm in ec or ec in c_norm) and len(c_norm) >= 3:
+            return True
+    return False
 
 def record_application(company, role, success, reason=""):
     """Record an application attempt."""
@@ -588,6 +616,7 @@ RULES:
 - For phone number fields: use "7760289275" (no country code prefix -- it's usually a separate dropdown).
 - For "How did you hear about us" / source fields: pick "Job Posting", "Online", "LinkedIn", or the simplest available option. Never pick "Employee Referral".
 - For yes/no questions: answer based on the applicant profile (sponsorship=Yes, over 18=Yes, former employee=No, criminal record=No, etc.)
+- For "right to work in UK" / "eligible to work" / "work authorization" / "do you currently have the right to work" questions: answer No -- the applicant does NOT currently have the right to work without sponsorship and requires a Skilled Worker visa sponsored by the new employer. Do NOT answer Yes to these questions.
 - For open text / cover letter / "why this role" fields: write 2-3 professional sentences referencing the applicant's ACTUAL CV experience and tailored to the specific job description provided. Mention relevant projects, skills, and achievements from the CV. Never fabricate experience or skills not in the CV.
 - For ethnicity/race questions: ALWAYS pick "I prefer not to answer" or "Prefer not to say". Never guess ethnicity.
 - For disability/communities questions: ALWAYS pick "I prefer not to answer" or "None of the above".
@@ -1054,6 +1083,11 @@ def execute_actions(page, actions):
                     ok = _fill_with_events(page, el, value)
                     if ok:
                         log(f"    fill '{selector[:40]}' = '{value[:40]}'")
+                        # Track password used on Workday for later Sign In reuse
+                        if is_workday_url(page.url) and "password" in selector.lower() and value:
+                            domain_m = re.search(r'https?://([^/]+)', page.url)
+                            if domain_m:
+                                _workday_passwords[domain_m.group(1)] = value
                 else:
                     log(f"    fill: element not found '{selector[:50]}'")
 
@@ -1309,6 +1343,10 @@ def count_empty_required(page):
             document.querySelectorAll('input,select,textarea').forEach(el => {
                 if (!el.offsetParent) return;
                 if (el.type === 'hidden' || el.type === 'submit' || el.type === 'file') return;
+                // Skip honeypot fields (off-screen, tabindex=-1, or tiny dimensions)
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return;
+                if (el.tabIndex === -1 && el.name && ['website','url','hp','bot','trap'].some(h => el.name.toLowerCase().includes(h))) return;
                 const req = el.required || el.getAttribute('aria-required') === 'true';
                 if (!req) return;
                 if (el.type === 'checkbox' || el.type === 'radio') {
@@ -1349,8 +1387,33 @@ def is_success_page(page):
             "application complete", "we'll be in touch",
             "application has been submitted", "thanks for applying",
             "your application has been", "we have received your application",
+            # Ashby ATS
+            "you've applied", "you have applied", "application was submitted",
+            "your application is submitted", "successfully applied",
+            "we received your application", "your application is in",
+            # Oracle HCM
+            "my applications", "under review", "application is under review",
         ]
-        return any(m in visible_text for m in markers)
+        if any(m in visible_text for m in markers):
+            # Oracle HCM: "My Applications" page can also show OTHER jobs, not just success
+            # Only count as success if we also see "under review" or Oracle HCM URL pattern
+            if "my applications" in visible_text and "oraclecloud.com" in page.url:
+                if "under review" in visible_text or "/myApplications" in page.url:
+                    return True
+                # Skip "my applications" marker if not confirmed as Oracle HCM success
+                other_markers = [m for m in markers if m != "my applications"]
+                if not any(m in visible_text for m in other_markers):
+                    return False
+            return True
+        # Ashby / Workable: URL pattern for confirmation
+        url = page.url.lower()
+        if any(p in url for p in ["/confirmation", "/apply/success", "/application/success", "?success=true", "/apply/confirmation"]):
+            return True
+        # Oracle HCM: /myApplications URL = application list (only success if "under review" visible)
+        if "oraclecloud.com" in page.url and "/myapplications" in page.url.lower():
+            if "under review" in visible_text:
+                return True
+        return False
     except Exception:
         return False
 
@@ -1362,7 +1425,6 @@ def click_next_button(page):
         "bottom-navigation-next-button",
         "bottom-navigation-done-button",
         "bottom-navigation-footer-button",
-        "autofillWithResume",
         "jobApply",
     ]:
         btn = page.locator(f'[data-automation-id="{wd_id}"]')
@@ -1375,12 +1437,14 @@ def click_next_button(page):
                 pass
 
     # Generic: try common button labels
+    # Note: Skip "Create Account" on Workday — auth is handled by _handle_workday_auth_page
+    workday_url = is_workday_url(page.url)
     for label in [
         "Next", "Continue", "Save and Continue", "Save & Continue",
         "Submit Application", "Submit", "Review and Submit",
         "Review & Submit", "Apply", "Apply Now", "Send Application",
         "Confirm", "Done", "Finish", "Complete",
-        "Create Account", "Sign In", "Register",
+        *([] if workday_url else ["Create Account", "Sign In", "Register"]),
         "Save and Next", "Proceed",
     ]:
         for role in ("button", "link"):
@@ -1402,7 +1466,7 @@ def click_next_button(page):
     # Last resort: JS search for any forward-looking button
     try:
         clicked = page.evaluate("""() => {
-            const targets = ['next','continue','submit','apply','save and continue','done','finish','review'];
+            const targets = ['next','continue','submit','apply','save and continue','done','finish','review','sign in','log in','login'];
             const btns = [...document.querySelectorAll('button,a[role="button"],input[type="submit"]')];
             for (const t of targets) {
                 const btn = btns.find(b => b.offsetParent && b.innerText.trim().toLowerCase().includes(t));
@@ -1426,10 +1490,16 @@ def handle_new_tabs(page, context):
         new_pages = [p for p in all_pages if p != page and not p.is_closed()]
         if new_pages:
             new_page = new_pages[-1]
+            # Wait for load, then poll until URL is non-blank (handles slow Workday new tabs)
             try:
-                new_page.wait_for_load_state("domcontentloaded", timeout=8000)
+                new_page.wait_for_load_state("domcontentloaded", timeout=12000)
             except Exception:
                 pass
+            # If still about:blank, wait up to 8 more seconds for URL to resolve
+            for _ in range(16):
+                if new_page.url not in ("about:blank", ""):
+                    break
+                time.sleep(0.5)
             if "linkedin.com" not in new_page.url and new_page.url not in ("about:blank", ""):
                 log(f"  Switched to new tab: {new_page.url}")
                 Stealth().apply_stealth_sync(new_page)
@@ -1550,7 +1620,7 @@ def get_company_apply_url(page, linkedin_url):
         url = new_page.url
         log(f"  Company URL (new tab): {url}")
         new_page.close()
-        if "linkedin.com" not in url:
+        if "linkedin.com" not in url and "chrome-error" not in url and url.startswith("http"):
             return url
     except Exception:
         pass
@@ -1567,7 +1637,7 @@ def get_company_apply_url(page, linkedin_url):
                 pass
             url = np.url
             np.close()
-            if "linkedin.com" not in url and url not in ("about:blank", ""):
+            if "linkedin.com" not in url and "chrome-error" not in url and url not in ("about:blank", "") and url.startswith("http"):
                 return url
     except Exception:
         pass
@@ -1715,6 +1785,68 @@ def _auto_check_consent(page):
         log(f"    auto-consent error: {e}")
 
 
+def _auto_fill_workable_required_radios(page):
+    """Auto-fill unanswered required radio-button questions in Workable ATS.
+    Workable groups are <div data-ui="radio-group"> with <label> options.
+    Picks 'Prefer not to say/answer' if available, otherwise the first option."""
+    if "workable.com" not in page.url:
+        return
+    try:
+        filled = page.evaluate("""() => {
+            const filled = [];
+            // Find all radio groups that have no checked option
+            const groups = document.querySelectorAll('[data-ui="radio-group"], [data-testid="radio-group"], .radio-group');
+            groups.forEach(group => {
+                if (!group.offsetParent) return;
+                const radios = group.querySelectorAll('input[type="radio"]');
+                if (!radios.length) return;
+                const anyChecked = Array.from(radios).some(r => r.checked);
+                if (anyChecked) return;
+                // Find a 'prefer not to say/answer' option, else first option
+                let picked = null;
+                const labels = group.querySelectorAll('label');
+                for (const lbl of labels) {
+                    const t = lbl.innerText.toLowerCase();
+                    if (t.includes('prefer not') || t.includes('decline') || t.includes('do not wish')) {
+                        picked = lbl;
+                        break;
+                    }
+                }
+                if (!picked && labels.length) picked = labels[0];
+                if (picked) {
+                    const inp = picked.querySelector('input[type="radio"]') ||
+                                document.getElementById(picked.getAttribute('for'));
+                    if (inp) { inp.click(); filled.push(picked.innerText.trim().slice(0, 50)); }
+                    else { picked.click(); filled.push(picked.innerText.trim().slice(0, 50)); }
+                }
+            });
+            // Also handle native radio inputs with required attr not in above groups
+            const reqRadioNames = new Set();
+            document.querySelectorAll('input[type="radio"][required], input[type="radio"][aria-required="true"]').forEach(r => {
+                if (!r.offsetParent) return;
+                reqRadioNames.add(r.name);
+            });
+            reqRadioNames.forEach(name => {
+                const radios = document.querySelectorAll('input[type="radio"][name="' + name + '"]');
+                if (Array.from(radios).some(r => r.checked)) return;
+                // Try 'prefer not to say', else first
+                let picked = null;
+                for (const r of radios) {
+                    const lbl = document.querySelector('label[for="' + r.id + '"]');
+                    const t = (lbl ? lbl.innerText : r.value || '').toLowerCase();
+                    if (t.includes('prefer not') || t.includes('decline')) { picked = r; break; }
+                }
+                if (!picked) picked = radios[0];
+                if (picked) { picked.click(); filled.push('radio:' + name.slice(0, 40)); }
+            });
+            return filled;
+        }""")
+        for label in (filled or []):
+            log(f"    workable-radio: auto-selected '{label}'")
+    except Exception as e:
+        log(f"    workable-radio error: {e}")
+
+
 def _auto_fill_oracle_jet_dropdowns(page):
     """Auto-fill Oracle JET custom dropdowns (oj-select-one, oj-combobox-one).
     These are NOT standard <select> elements — they require click-to-open + option click.
@@ -1833,8 +1965,14 @@ def _auto_fill_oracle_jet_dropdowns(page):
                     # For specific EEO questions, try known option texts
                     q = label.lower()
                     fallback_options = []
-                    if "race" in q or "ethnic" in q:
+                    if "title" in q or "salutation" in q:
+                        fallback_options = ["Ms.", "Ms", "Miss"]
+                    elif "race" in q or "ethnic" in q:
                         fallback_options = ["Two or More", "Other", "Prefer"]
+                    elif "sexual orientation" in q or "sexual_orientation" in q:
+                        fallback_options = ["Heterosexual", "Straight", "Heterosexual / Straight", "Prefer not to say"]
+                    elif "gender identity" in q or "gender_identity" in q:
+                        fallback_options = ["Female", "Woman", "Prefer not to say"]
                     elif "sex" in q:
                         fallback_options = ["Female", "Prefer"]
                     elif "gender" in q:
@@ -1843,6 +1981,10 @@ def _auto_fill_oracle_jet_dropdowns(page):
                         fallback_options = ["not a", "prefer not", "no"]
                     elif "disability" in q:
                         fallback_options = ["don't wish", "prefer not", "no"]
+                    elif "related to" in q or "employee" in q or "relative" in q:
+                        fallback_options = ["No", "no"]
+                    elif "requirement" in q or "adjustment" in q or "reasonable" in q:
+                        fallback_options = ["No", "no"]
 
                     for opt_text in fallback_options:
                         try:
@@ -1883,7 +2025,7 @@ def _auto_fill_oracle_jet_dropdowns(page):
 def _auto_fill_workday_dropdowns(page):
     """Auto-fill Workday custom dropdown fields that Claude struggles with.
     Workday uses custom prompt containers with specific CSS patterns."""
-    if "myworkdayjobs.com" not in page.url and "wd3." not in page.url and "wd5." not in page.url:
+    if not is_workday_url(page.url) and "wd3." not in page.url and "wd5." not in page.url:
         return
 
     try:
@@ -1901,8 +2043,10 @@ def _auto_fill_workday_dropdowns(page):
                 if (!p.offsetParent) return;
                 const btn = p.querySelector('button[aria-haspopup], [role="combobox"]');
                 if (!btn) return;
-                const val = btn.innerText.trim();
-                if (val && val.length > 2 && val !== 'Select' && !val.includes('required')) return;
+                const val = btn.innerText.trim().toLowerCase();
+                const EMPTY_VALS2 = ['', 'select', 'select one', 'none selected', 'please select',
+                                     '-- none --', '- none -', 'choose one', 'choose...'];
+                if (val && !EMPTY_VALS2.includes(val) && !val.includes('required')) return;
                 // Get label
                 const aid = p.getAttribute('data-automation-id') || '';
                 let label = '';
@@ -1914,8 +2058,10 @@ def _auto_fill_workday_dropdowns(page):
             // Also find ANY visible button[aria-haspopup="listbox"] that's empty
             document.querySelectorAll('button[aria-haspopup="listbox"]').forEach(btn => {
                 if (!btn.offsetParent) return;
-                const val = btn.innerText.trim();
-                if (val && val.length > 2 && val !== 'Select') return;
+                const val = btn.innerText.trim().toLowerCase();
+                const EMPTY_VALS = ['', 'select', 'select one', 'none selected', 'please select',
+                                    '-- none --', '- none -', 'choose one', 'choose...'];
+                if (val && !EMPTY_VALS.includes(val)) return;
                 // Check not already found
                 const aid = btn.getAttribute('data-automation-id') || '';
                 if (results.some(r => r.aid === aid && aid)) return;
@@ -1951,15 +2097,16 @@ def _auto_fill_workday_dropdowns(page):
 
             preferred = []
             if "hear" in label or "source" in label or "source" in aid or "hear" in aid:
-                preferred = ["Job Posting", "LinkedIn", "Website", "Job Board", "Internet", "Online"]
-            elif "country" in label or "country" in aid:
+                preferred = ["LinkedIn", "Job Posting", "Website", "Job Board", "Internet", "Online", "Social Media"]
+            elif "county" in label or "region" in label or "countryregion" in aid:
+                preferred = ["Greater London", "London"]
+            elif ("country" in label or "country" in aid) and "region" not in aid and "code" not in label:
                 preferred = ["United Kingdom", "UK", "Great Britain"]
             elif "phone" in label and ("type" in label or "device" in label):
                 preferred = ["Mobile", "Cell"]
-            elif "phone" in label and "code" in label:
+            elif ("phone" in label and "code" in label) or "phonecode" in aid or "countryPhoneCode" in item.get("aid", ""):
                 preferred = ["United Kingdom (+44)", "United Kingdom", "+44"]
             else:
-                # Unknown dropdown - pick first option
                 preferred = []
 
             log(f"    workday-dropdown: filling '{item['label']}' (aid={item['aid'][:30]})")
@@ -2034,6 +2181,933 @@ def _auto_fill_workday_dropdowns(page):
 
     except Exception as e:
         log(f"    workday-dropdown error: {e}")
+
+
+def _workday_fill_phone_code(page):
+    """Fill the Workday phone country code dropdown (phoneNumber--countryPhoneCode).
+    This field defaults to 'Select One' and often isn't filled by the generic handlers."""
+    if not is_workday_url(page.url):
+        return False
+    try:
+        # Check if the phone code button is visible and showing a placeholder
+        state = page.evaluate("""() => {
+            const PLACEHOLDERS = ['select one', 'select', '', 'none selected'];
+            const selectors = [
+                '[id*="countryPhoneCode"]',
+                '[data-automation-id*="countryPhoneCode"]',
+                '[id*="phoneCode"]',
+            ];
+            for (const sel of selectors) {
+                const els = document.querySelectorAll(sel);
+                for (const el of els) {
+                    if (!el.offsetParent) continue;
+                    const btn = el.tagName === 'BUTTON' ? el : el.querySelector('button[aria-haspopup]');
+                    if (!btn) continue;
+                    const val = btn.innerText.trim().toLowerCase();
+                    if (PLACEHOLDERS.includes(val)) return {needs_fill: true};
+                }
+            }
+            return {needs_fill: false};
+        }""") or {}
+        if not state.get("needs_fill"):
+            return False
+
+        log("    phone-code-fix: filling country phone code dropdown")
+
+        # Click to open the dropdown
+        opened = page.evaluate("""() => {
+            const selectors = [
+                '[id*="countryPhoneCode"]',
+                '[data-automation-id*="countryPhoneCode"]',
+                '[id*="phoneCode"]',
+            ];
+            for (const sel of selectors) {
+                const els = document.querySelectorAll(sel);
+                for (const el of els) {
+                    if (!el.offsetParent) continue;
+                    const btn = el.tagName === 'BUTTON' ? el : el.querySelector('button[aria-haspopup]');
+                    if (!btn) continue;
+                    btn.click();
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        if not opened:
+            return False
+
+        time.sleep(0.8)
+
+        # Type "United Kingdom" to filter
+        try:
+            page.keyboard.type("United Kingdom", delay=30)
+            time.sleep(0.8)
+        except Exception:
+            pass
+
+        # Find and click the UK +44 option
+        opts = page.locator('[role="option"]')
+        count = opts.count()
+        for i in range(min(count, 10)):
+            try:
+                txt = opts.nth(i).inner_text().strip()
+                if "united kingdom" in txt.lower() and "+44" in txt:
+                    opts.nth(i).evaluate("el => el.click()")
+                    log(f"    phone-code-fix: selected '{txt}'")
+                    time.sleep(0.5)
+                    return True
+            except Exception:
+                continue
+
+        # Fallback: first UK option
+        for i in range(min(count, 10)):
+            try:
+                txt = opts.nth(i).inner_text().strip()
+                if "united kingdom" in txt.lower():
+                    opts.nth(i).evaluate("el => el.click()")
+                    log(f"    phone-code-fix: selected '{txt}' (fallback)")
+                    time.sleep(0.5)
+                    return True
+            except Exception:
+                continue
+
+        page.keyboard.press("Escape")
+        return False
+
+    except Exception as e:
+        log(f"    phone-code-fix error: {e}")
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False
+
+
+def _workday_fill_county_region(page):
+    """Directly fill the address--countryRegion (County/Region) dropdown in Workday.
+    Uses JS to enumerate listbox options and find 'Greater London' or 'London'."""
+    if not is_workday_url(page.url):
+        return False
+    try:
+        # Find the county/region button — it has id containing 'countryRegion' OR aria-label containing 'County'
+        result = page.evaluate("""() => {
+            // Find the county region button — Workday uses id="address--countryRegion"
+            // or a container with data-automation-id containing countryRegion
+            let btn = null;
+
+            // Direct ID selector (most reliable)
+            const directEl = document.getElementById('address--countryRegion');
+            if (directEl) {
+                // It might be a button or a container
+                if (directEl.tagName === 'BUTTON') {
+                    btn = directEl;
+                } else {
+                    btn = directEl.querySelector('button[aria-haspopup], [role="combobox"]') || directEl;
+                }
+            }
+
+            if (!btn) {
+                // Try data-automation-id variations
+                for (const sel of [
+                    '[data-automation-id="countryRegion"] button',
+                    '[data-automation-id*="countryRegion"] button',
+                    '[id*="countryRegion"] button'
+                ]) {
+                    const el = document.querySelector(sel);
+                    if (el && el.offsetParent) { btn = el; break; }
+                }
+            }
+
+            if (!btn) {
+                // Try looking for label "County" near a button
+                const labels = document.querySelectorAll('label');
+                for (const lbl of labels) {
+                    if (!lbl.offsetParent) continue;
+                    if (/^county/i.test(lbl.innerText.trim())) {
+                        const id = lbl.getAttribute('for');
+                        if (id) {
+                            const el = document.getElementById(id);
+                            if (el) { btn = el; break; }
+                        }
+                        const parent = lbl.parentElement;
+                        if (parent) {
+                            const b = parent.querySelector('button[aria-haspopup]');
+                            if (b) { btn = b; break; }
+                        }
+                    }
+                }
+            }
+
+            if (!btn) return {found: false};
+            return {found: true, currentVal: btn.innerText.trim()};
+        }""")
+        if not result or not result.get("found"):
+            return False
+        current = result.get("currentVal", "")
+        # If already filled with something meaningful (not empty/Select/Select One)
+        current_lower = current.lower()
+        already_filled = (
+            current and
+            current_lower not in ("select", "select one", "") and
+            "select one" not in current_lower and
+            "required" not in current_lower and
+            len(current) > 3
+        )
+        if already_filled:
+            log(f"    county-fix: already set to '{current[:40]}' — skipping")
+            return True
+
+        # Click the county region element using JS to bypass click_filter overlay
+        clicked = page.evaluate("""() => {
+            // Try direct id first
+            let btn = document.getElementById('address--countryRegion');
+            if (btn) { btn.click(); return true; }
+
+            // Try data-automation-id selectors
+            for (const sel of [
+                '[data-automation-id="countryRegion"] button',
+                '[data-automation-id*="countryRegion"] button',
+                '[id*="countryRegion"] button'
+            ]) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetParent) { el.click(); return true; }
+            }
+
+            // Try click_filter overlay for county/region
+            const overlays = document.querySelectorAll('[data-automation-id="click_filter"]');
+            for (const ov of overlays) {
+                const label = (ov.getAttribute('aria-label') || '').toLowerCase();
+                if (label.includes('county') || label.includes('region')) {
+                    ov.click();
+                    return true;
+                }
+            }
+
+            // Try label-based approach
+            const labels = document.querySelectorAll('label');
+            for (const lbl of labels) {
+                if (!lbl.offsetParent) continue;
+                if (/^county/i.test(lbl.innerText.trim())) {
+                    const id = lbl.getAttribute('for');
+                    if (id) {
+                        const el = document.getElementById(id);
+                        if (el) { el.click(); return true; }
+                    }
+                    const parent = lbl.parentElement;
+                    if (parent) {
+                        const b = parent.querySelector('button[aria-haspopup], [data-automation-id="click_filter"]');
+                        if (b) { b.click(); return true; }
+                    }
+                }
+            }
+            return false;
+        }""")
+        if not clicked:
+            return False
+        time.sleep(1.0)
+
+        # Now type to filter
+        for search in ["Greater London", "London"]:
+            page.keyboard.type(search, delay=50)
+            time.sleep(1.0)
+            # Look for the option
+            opts = page.locator('[role="option"]')
+            count = opts.count()
+            for i in range(min(count, 20)):
+                opt = opts.nth(i)
+                try:
+                    if not opt.is_visible():
+                        continue
+                    txt = opt.inner_text().strip()
+                    if "london" in txt.lower():
+                        opt.click()
+                        log(f"    county-fix: selected '{txt}' for County/Region")
+                        time.sleep(0.5)
+                        return True
+                except Exception:
+                    continue
+            # Clear and try next search
+            page.keyboard.press("Control+a")
+            page.keyboard.press("Backspace")
+            time.sleep(0.3)
+
+        page.keyboard.press("Escape")
+        return False
+    except Exception as e:
+        log(f"    county-fix error: {e}")
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False
+
+
+def _workday_fill_phone_code(page):
+    """Fill the phoneNumber--countryPhoneCode dropdown in Workday with United Kingdom (+44)."""
+    if not is_workday_url(page.url):
+        return False
+    try:
+        # Check if field is visible and not already set
+        result = page.evaluate("""() => {
+            for (const sel of [
+                '[data-automation-id="phoneNumber--countryPhoneCode"] button',
+                '[data-automation-id="phoneNumber--countryPhoneCode"] [role="combobox"]',
+                '#phoneNumber--countryPhoneCode',
+                '[id*="countryPhoneCode"]'
+            ]) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetParent) return {found: true, val: el.innerText.trim()};
+            }
+            return {found: false, val: ''};
+        }""")
+        if not result or not result.get("found"):
+            return False
+        current = result.get("val", "")
+        if "+44" in current or "United Kingdom" in current:
+            return True  # already set
+
+        # Click to open the dropdown via JS
+        clicked = page.evaluate("""() => {
+            for (const sel of [
+                '[data-automation-id="phoneNumber--countryPhoneCode"] [data-automation-id="click_filter"]',
+                '[data-automation-id="phoneNumber--countryPhoneCode"] button[aria-haspopup]',
+                '[data-automation-id="phoneNumber--countryPhoneCode"] [role="combobox"]',
+                '#phoneNumber--countryPhoneCode',
+                '[id*="countryPhoneCode"]'
+            ]) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetParent) { el.click(); return true; }
+            }
+            return false;
+        }""")
+        if not clicked:
+            return False
+        time.sleep(1.0)
+
+        # Type to filter and pick United Kingdom (+44)
+        page.keyboard.type("United Kingdom", delay=50)
+        time.sleep(1.0)
+        opts = page.locator('[role="option"]')
+        for i in range(min(opts.count(), 20)):
+            opt = opts.nth(i)
+            try:
+                if not opt.is_visible():
+                    continue
+                txt = opt.inner_text().strip()
+                if "united kingdom" in txt.lower():
+                    opt.click()
+                    log(f"    phone-code-fix: selected '{txt}'")
+                    time.sleep(0.5)
+                    return True
+            except Exception:
+                continue
+
+        page.keyboard.press("Escape")
+        return False
+    except Exception as e:
+        log(f"    phone-code-fix error: {e}")
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False
+
+
+def _workday_fill_source_dropdown(page):
+    """Directly fill the 'How Did You Hear About Us' / source dropdown in Workday."""
+    if not is_workday_url(page.url):
+        return False
+    try:
+        log("    source-fix: checking")
+        # Close any open dropdowns first
+        try:
+            page.keyboard.press("Escape")
+            time.sleep(0.3)
+            page.keyboard.press("Escape")
+            time.sleep(0.3)
+
+        # ── NEW: Workday multiselect handler ─────────────────────────────────────
+        # Blue Owl (and some other tenants) render "How Did You Hear About Us?" as
+        # a multiSelectContainer widget, not a standard dropdown button.
+        # Interaction: click multiselectInputContainer → wait for options → click best option.
+        except Exception:
+            pass
+        try:
+            # Use Playwright native clicks (not JS) so React synthetic events fire properly
+            multi_inputs = page.locator('[data-automation-id="multiselectInputContainer"]')
+            for i in range(multi_inputs.count()):
+                try:
+                    container = multi_inputs.nth(i)
+                    if not container.is_visible(timeout=300):
+                        continue
+                    # Check if this container belongs to the "How Did You Hear About Us?" field
+                    lbl_text = container.evaluate("""el => {
+                        let node = el.parentElement;
+                        for (let lvl = 0; lvl < 8 && node; lvl++, node = node.parentElement) {
+                            const lbl = node.querySelector('label');
+                            if (lbl && /how did you hear|hear about us/i.test(lbl.innerText))
+                                return lbl.innerText;
+                        }
+                        return '';
+                    }""") or ""
+                    if not re.search(r'how did you hear|hear about us', lbl_text, re.I):
+                        continue
+                    # Check if already filled via aria instruction
+                    aria_text = container.evaluate("""el => {
+                        let node = el.parentElement;
+                        for (let lvl = 0; lvl < 8 && node; lvl++, node = node.parentElement) {
+                            const ai = node.querySelector('[data-automation-id="promptAriaInstruction"]');
+                            if (ai) return ai.innerText.trim().toLowerCase();
+                        }
+                        return '';
+                    }""") or ""
+                    if aria_text and not aria_text.startswith("0 item"):
+                        log("    source-fix: multiselect already filled — done")
+                        return True
+                    # Open with Playwright native click (triggers React events)
+                    container.click()
+                    log("    source-fix: multiselect opened — selecting option")
+                    time.sleep(1.5)
+                    opts = page.locator('[role="option"]')
+                    PRIORITY = ["job board", "linkedin", "agency", "career site", "website", "online", "other"]
+                    selected = None
+                    for kw in PRIORITY:
+                        for j in range(min(opts.count(), 30)):
+                            try:
+                                txt = opts.nth(j).inner_text().strip()
+                                if kw in txt.lower():
+                                    opts.nth(j).scroll_into_view_if_needed(timeout=1000)
+                                    opts.nth(j).click()  # Playwright native click with scroll
+                                    log(f"    source-fix: multiselect selected '{txt}'")
+                                    selected = txt
+                                    break
+                            except Exception:
+                                continue
+                        if selected:
+                            break
+                    if not selected and opts.count() > 0:
+                        for j in range(min(opts.count(), 10)):
+                            try:
+                                txt = opts.nth(j).inner_text().strip()
+                                if txt and "referral" not in txt.lower():
+                                    opts.nth(j).scroll_into_view_if_needed(timeout=1000)
+                                    opts.nth(j).click()
+                                    log(f"    source-fix: multiselect fallback '{txt}'")
+                                    selected = txt
+                                    break
+                            except Exception:
+                                continue
+                    if selected:
+                        time.sleep(1.0)
+                        # Close dropdown: press Escape if still open
+                        try:
+                            if page.locator('[role="listbox"]').is_visible(timeout=500):
+                                page.keyboard.press("Escape")
+                                time.sleep(0.3)
+                        except Exception:
+                            pass
+                        return True
+                    break  # Found the right container but couldn't select — fall through
+                except Exception as ce:
+                    continue
+        except Exception as me:
+            log(f"    source-fix: multiselect error: {me}")
+        # ── END multiselect handler ──────────────────────────────────────────────
+
+        try:
+            pass  # placeholder for original try block continuation
+        except Exception:
+            pass
+        # Find the source dropdown by known automation id or label text
+        # Find and click the source dropdown
+        # First check current value WITHOUT clicking, and whether the field is visible at all
+        good_source_vals = {"linkedin", "job posting", "job board", "website", "online", "internet", "social media", "nb careers"}
+        source_state = page.evaluate("""() => {
+            // Direct ID check — use EXACT match only to avoid matching phone code elements
+            for (const sel of ['[id="source--source"]', '[data-automation-id="source--source"]']) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetParent) return {visible: true, val: el.innerText.trim() || el.value || ''};
+            }
+            // Button/combobox with aria-labelledby / aria-label
+            const allBtns = Array.from(document.querySelectorAll(
+                'button[aria-haspopup="listbox"], [role="combobox"]'
+            )).filter(b => b.offsetParent);
+            for (const btn of allBtns) {
+                const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
+                if (/how did you hear|hear about us/i.test(ariaLabel))
+                    return {visible: true, val: btn.innerText.trim()};
+                for (const id of (btn.getAttribute('aria-labelledby') || '').split(' ')) {
+                    const lbl = document.getElementById(id);
+                    if (lbl && /how did you hear|hear about us/i.test(lbl.innerText))
+                        return {visible: true, val: btn.innerText.trim()};
+                }
+            }
+            // click_filter overlays
+            for (const ov of document.querySelectorAll('[data-automation-id="click_filter"]')) {
+                const label = (ov.getAttribute('aria-label') || '').toLowerCase();
+                if (label.includes('hear') || label.includes('referral') || label.includes('how did'))
+                    return {visible: true, val: ov.innerText.trim()};
+            }
+            // Label proximity
+            const labels = document.querySelectorAll('label');
+            for (const lbl of labels) {
+                if (!lbl.offsetParent) continue;
+                if (!/how did you hear|hear about us/i.test(lbl.innerText)) continue;
+                const lblRect = lbl.getBoundingClientRect();
+                for (const btn of allBtns) {
+                    const r = btn.getBoundingClientRect();
+                    if (Math.abs(r.top - lblRect.top) < 200 && Math.abs(r.left - lblRect.left) < 500)
+                        return {visible: true, val: btn.innerText.trim()};
+                }
+                return {visible: false, val: '', labelFound: true};
+            }
+            return {visible: false, val: '', labelFound: false};
+        }""") or {}
+        if not source_state.get("visible"):
+            # If the label is present but no button found, try direct combobox input before giving up.
+            if source_state.get("labelFound"):
+                log("    source-fix: label found but no dropdown button — trying direct combobox input")
+                filled = False
+                for src_sel in ['[id="source--source"]', '[data-automation-id="source--source"]']:
+                    try:
+                        inp = page.locator(src_sel)
+                        if inp.count() > 0:
+                            inp.first.scroll_into_view_if_needed(timeout=2000)
+                            inp.first.click(timeout=2000)
+                            time.sleep(0.3)
+                            inp.first.fill("")
+                            time.sleep(0.2)
+                            inp.first.type("LinkedIn", delay=40)
+                            time.sleep(0.8)
+                            opts = page.locator('[role="option"]')
+                            if opts.count() > 0:
+                                for i in range(min(opts.count(), 10)):
+                                    try:
+                                        txt = opts.nth(i).inner_text().strip()
+                                        if "linkedin" in txt.lower():
+                                            opts.nth(i).evaluate("el => el.click()")
+                                            log(f"    source-fix: label-found combobox selected '{txt}'")
+                                            time.sleep(0.5)
+                                            filled = True
+                                            break
+                                    except Exception:
+                                        continue
+                            if not filled and opts.count() > 0:
+                                for i in range(min(opts.count(), 10)):
+                                    try:
+                                        txt = opts.nth(i).inner_text().strip()
+                                        if txt and "referral" not in txt.lower() and "employee" not in txt.lower():
+                                            opts.nth(i).evaluate("el => el.click()")
+                                            log(f"    source-fix: label-found fallback '{txt}'")
+                                            time.sleep(0.5)
+                                            filled = True
+                                            break
+                                    except Exception:
+                                        continue
+                            if filled:
+                                return True
+                            page.keyboard.press("Escape")
+                            break
+                    except Exception:
+                        continue
+            log("    source-fix: source dropdown not visible on this section — skipping")
+            return True  # Not an error, field is on a different section
+        current_source = source_state.get("val", "")
+        if current_source:
+            log(f"    source-fix: current source value = '{current_source[:40]}'")
+
+        # If current value looks like a country name, the label traversal found the wrong element.
+        # Country names are multi-word with capital letters, often containing "Islands", "States", etc.
+        country_like_patterns = [
+            r'\b(islands|states|republic|kingdom|federation|emirates|africa|america|europe|asia)\b',
+        ]
+        if current_source and any(re.search(p, current_source, re.I) for p in country_like_patterns):
+            log(f"    source-fix: button shows country value — trying direct input approach")
+            # The proximity check found the Country button. Try direct text-input approach:
+            # [id="source--source"] is Workday's combobox text input for source-of-hire
+            filled = False
+            for src_sel in ['[id="source--source"]', '[data-automation-id="source--source"]']:
+                try:
+                    inp = page.locator(src_sel)
+                    if inp.count() > 0 and inp.first.is_visible(timeout=1000):
+                        inp.first.click()
+                        time.sleep(0.3)
+                        inp.first.fill("")
+                        time.sleep(0.2)
+                        inp.first.type("LinkedIn", delay=40)
+                        time.sleep(0.8)
+                        # Try to click a matching option
+                        opts = page.locator('[role="option"]')
+                        if opts.count() > 0:
+                            for i in range(min(opts.count(), 10)):
+                                try:
+                                    txt = opts.nth(i).inner_text().strip()
+                                    if "linkedin" in txt.lower():
+                                        opts.nth(i).evaluate("el => el.click()")
+                                        log(f"    source-fix: direct-input selected '{txt}'")
+                                        time.sleep(0.5)
+                                        filled = True
+                                        break
+                                except Exception:
+                                    continue
+                        if not filled and opts.count() > 0:
+                            # Fallback: pick first non-referral option
+                            for i in range(min(opts.count(), 10)):
+                                try:
+                                    txt = opts.nth(i).inner_text().strip()
+                                    if txt and "referral" not in txt.lower() and "employee" not in txt.lower():
+                                        opts.nth(i).evaluate("el => el.click()")
+                                        log(f"    source-fix: direct-input fallback '{txt}'")
+                                        time.sleep(0.5)
+                                        filled = True
+                                        break
+                                except Exception:
+                                    continue
+                        if filled:
+                            return True
+                        page.keyboard.press("Escape")
+                        break
+                except Exception:
+                    continue
+            return True  # Not an error even if not found
+
+        # Now click to open — try multiple approaches
+        # First: debug dump to find the actual source field element
+        src_debug = page.evaluate("""() => {
+            const labels = document.querySelectorAll('label');
+            for (const lbl of labels) {
+                if (!lbl.offsetParent) continue;
+                if (!/how did you hear|hear about us/i.test(lbl.innerText)) continue;
+                const results = [];
+                // Walk up 5 levels from label to find interactive elements
+                let node = lbl.parentElement;
+                for (let lvl = 0; lvl < 5 && node; lvl++, node = node.parentElement) {
+                    const els = node.querySelectorAll('button, [role="button"], [role="combobox"], [role="listbox"], select, input[type="text"], [data-automation-id]');
+                    for (const el of els) {
+                        if (!el.offsetParent) continue;
+                        results.push({
+                            tag: el.tagName,
+                            id: el.id || '',
+                            autoId: el.getAttribute('data-automation-id') || '',
+                            role: el.getAttribute('role') || '',
+                            text: (el.innerText || el.value || '').trim().slice(0, 30),
+                            lvl: lvl
+                        });
+                    }
+                    if (results.length > 0) break;
+                }
+                return results.slice(0, 5);
+            }
+            return [];
+        }""") or []
+        if src_debug:
+            log(f"    source-fix: nearby elements: {src_debug}")
+
+        # Log what [id="source--source"] actually is on this page
+        src_elem_info = page.evaluate("""() => {
+            const el = document.querySelector('[id="source--source"]');
+            if (!el) return null;
+            let path = [];
+            let node = el;
+            for (let i = 0; i < 4 && node; i++, node = node.parentElement) {
+                path.push(node.tagName + (node.id ? '#'+node.id : '') + (node.getAttribute('data-automation-id') ? '['+node.getAttribute('data-automation-id')+']' : ''));
+            }
+            return {tag: el.tagName, id: el.id, type: el.type || '', autoId: el.getAttribute('data-automation-id') || '', visible: !!el.offsetParent, val: (el.innerText || el.value || '').trim().slice(0, 40), path: path.join(' > ')};
+        }""")
+        if src_elem_info:
+            log(f"    source-fix: [id=source--source] info: {src_elem_info}")
+
+        # If the dropdown/multiselect is already open (e.g. fill action typed into searchbox),
+        # skip the JS click and go straight to option selection
+        _pre_opts = page.locator('[role="option"]')
+        _pre_count = _pre_opts.count()
+        if _pre_count > 0:
+            log(f"    source-fix: dropdown already open ({_pre_count} options) — skipping click")
+            clicked = 'already-open'
+        else:
+            clicked = page.evaluate("""() => {
+            // Approach 0a: find formField container with "how did you hear" label, click its button
+            // This is the most targeted approach and avoids clicking the wrong element
+            for (const container of document.querySelectorAll('[data-automation-id^="formField"]')) {
+                const lbl = container.querySelector('label');
+                if (!lbl || !/how did you hear|hear about us/i.test(lbl.innerText)) continue;
+                // Found the right container — click its dropdown button
+                const btn = container.querySelector('button[aria-haspopup], button[data-automation-id], [role="combobox"]');
+                if (btn && btn.offsetParent) { btn.click(); return 'form-field-container'; }
+                // Try clicking any visible interactive element in the container
+                const anyBtn = container.querySelector('button');
+                if (anyBtn && anyBtn.offsetParent) { anyBtn.click(); return 'form-field-button'; }
+            }
+            // Approach 0b: find by label proximity, broader element types
+            const labels = document.querySelectorAll('label');
+            for (const lbl of labels) {
+                if (!lbl.offsetParent) continue;
+                if (!/how did you hear|hear about us/i.test(lbl.innerText)) continue;
+                const lblRect = lbl.getBoundingClientRect();
+                // Search more broadly: buttons, selects, [role="button"], [data-automation-id*="select"]
+                const candidates = Array.from(document.querySelectorAll(
+                    'button, [role="button"], [role="combobox"], select, [data-automation-id*="select"], [data-automation-id*="dropdown"]'
+                )).filter(el => el.offsetParent);
+                let best = null, minDist = Infinity;
+                for (const el of candidates) {
+                    const r = el.getBoundingClientRect();
+                    const dy = r.top - lblRect.top;
+                    const dx = Math.abs(r.left - lblRect.left);
+                    if (dy >= -20 && dy < 300 && dx < 600) {
+                        const dist = Math.sqrt(dx*dx + dy*dy);
+                        if (dist < minDist) { minDist = dist; best = el; }
+                    }
+                }
+                if (best) { best.click(); return 'label-proximity-broad'; }
+            }
+            // Approach 0c: direct EXACT ID (Workday standard source--source) — ONLY if not phone code
+            for (const sel of ['[id="source--source"]', '[data-automation-id="source--source"]']) {
+                const el = document.querySelector(sel);
+                // Skip if this element is inside a phone number section
+                if (el && el.offsetParent) {
+                    const phoneParent = el.closest('[data-automation-id*="phone"], [id*="phone"]');
+                    if (!phoneParent) { el.click(); return 'direct-id'; }
+                }
+            }
+
+            const allBtns = Array.from(document.querySelectorAll('button[aria-haspopup="listbox"]'))
+                .filter(b => b.offsetParent);
+
+            // Approach 1: button with aria-labelledby / aria-label matching "hear about us"
+            for (const btn of allBtns) {
+                const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
+                if (/how did you hear|hear about us/i.test(ariaLabel)) {
+                    btn.click(); return 'aria-label';
+                }
+                for (const id of (btn.getAttribute('aria-labelledby') || '').split(' ')) {
+                    const lbl = document.getElementById(id);
+                    if (lbl && /how did you hear|hear about us/i.test(lbl.innerText)) {
+                        btn.click(); return 'aria-labelledby';
+                    }
+                }
+            }
+            // Approach 2: click_filter overlay with aria-label containing hear/referral
+            for (const ov of document.querySelectorAll('[data-automation-id="click_filter"]')) {
+                const label = (ov.getAttribute('aria-label') || '').toLowerCase();
+                if (label.includes('hear') || label.includes('referral') || label.includes('how did')) {
+                    ov.click(); return 'click_filter';
+                }
+            }
+            // Approach 3: proximity — find the button visually closest to the "How Did You Hear" label
+            const labels3 = document.querySelectorAll('label');
+            for (const lbl of labels3) {
+                if (!lbl.offsetParent) continue;
+                if (!/how did you hear|hear about us/i.test(lbl.innerText)) continue;
+                const lblRect = lbl.getBoundingClientRect();
+                let closest = null, minDist = Infinity;
+                for (const btn of allBtns) {
+                    const r = btn.getBoundingClientRect();
+                    const dy = r.top - lblRect.top;
+                    const dx = Math.abs(r.left - lblRect.left);
+                    if (dy >= -20 && dy < 200 && dx < 500) {
+                        const dist = Math.sqrt(dx*dx + dy*dy);
+                        if (dist < minDist) { minDist = dist; closest = btn; }
+                    }
+                }
+                if (closest) { closest.click(); return 'proximity'; }
+            }
+            return false;
+        }""")
+        log(f"    source-fix: click result = {clicked!r}")
+        if not clicked:
+            return False
+        time.sleep(1.0)
+
+        # List all available options, then pick best match
+        time.sleep(1.0)
+        opts = page.locator('[role="option"]')
+        all_opts = []
+        count = opts.count()
+        log(f"    source-fix: found {count} options in dropdown")
+        # Bail if wrong dropdown: options look like phone/country codes with NO source keywords present
+        SOURCE_KEYWORDS = {"agency", "job board", "job posting", "linkedin", "website", "online",
+                           "internet", "social media", "referral", "career site", "other", "network",
+                           "organization", "contractor", "former", "external", "internal"}
+        if count > 20 or count > 50:
+            sample_texts = []
+            for i in range(min(count, 15)):
+                try:
+                    t = opts.nth(i).inner_text().strip()
+                    if t:
+                        sample_texts.append(t)
+                except Exception:
+                    pass
+            log(f"    source-fix: sample options: {sample_texts[:8]}")
+            has_source_keywords = any(
+                any(kw in t.lower() for kw in SOURCE_KEYWORDS) for t in sample_texts
+            )
+            if has_source_keywords:
+                pass  # This is actually the right dropdown — proceed
+            else:
+                is_phone_codes = sum(1 for t in sample_texts if re.search(r'\(\+\d+\)', t)) >= 2
+                is_country_list = sum(1 for t in sample_texts if re.search(
+                    r'\b(island|states|republic|kingdom|africa|america|europe)\b', t, re.I)) >= 2
+                if is_phone_codes or is_country_list or count > 200:
+                    reason = "phone codes" if is_phone_codes else ("country list" if is_country_list else f"{count} options")
+                    log(f"    source-fix: wrong dropdown ({reason}) — pressing Escape")
+                    try:
+                        page.keyboard.press("Escape")
+                        time.sleep(0.3)
+                    except Exception:
+                        pass
+                    return False
+        for i in range(min(count, 50)):
+            opt = opts.nth(i)
+            try:
+                txt = opt.inner_text().strip()
+                visible = opt.is_visible()
+                if visible and txt:
+                    all_opts.append((i, txt, opt))
+            except Exception:
+                continue
+
+        log(f"    source-fix: visible options: {[t for _, t, _ in all_opts[:10]]}")
+
+        if all_opts:
+            # Priority: LinkedIn > Job Posting > job board > website > online > first non-referral
+            priority_keywords = ["linkedin", "job posting", "job board", "website", "online", "internet", "social"]
+            selected_txt = None
+            for kw in priority_keywords:
+                for idx, txt, opt in all_opts:
+                    if kw in txt.lower():
+                        # Use evaluate to click to bypass click_filter
+                        try:
+                            opt.evaluate("el => el.click()")
+                        except Exception:
+                            opt.click()
+                        log(f"    source-fix: selected '{txt}' for How Did You Hear About Us")
+                        time.sleep(1.0)
+                        selected_txt = txt
+                        break
+                if selected_txt:
+                    break
+            if not selected_txt:
+                # If none matched, pick first (not employee referral or referral)
+                for idx, txt, opt in all_opts:
+                    if "employee" not in txt.lower() and "referral" not in txt.lower():
+                        try:
+                            opt.evaluate("el => el.click()")
+                        except Exception:
+                            opt.click()
+                        log(f"    source-fix: fallback selected '{txt}' for How Did You Hear About Us")
+                        time.sleep(1.0)
+                        selected_txt = txt
+                        break
+
+            if selected_txt:
+                # Close dropdown if still open
+                try:
+                    if page.locator('[role="listbox"]').is_visible(timeout=500):
+                        page.keyboard.press("Escape")
+                        time.sleep(0.5)
+                except Exception:
+                    pass
+                time.sleep(0.5)
+                # Verify source field — if it shows a good value already, skip sub-options
+                good_vals = ["linkedin", "job posting", "job board", "website", "online", "internet", "social", "agency", "career", "board"]
+                try:
+                    source_now = page.evaluate("""() => {
+                        for (const sel of ['[id="source--source"]', '[data-automation-id="source--source"]']) {
+                            const el = document.querySelector(sel);
+                            if (el && el.offsetParent) return el.innerText.trim() || el.value || '';
+                        }
+                        return '';
+                    }""") or ""
+                    if any(kw in source_now.lower() for kw in good_vals):
+                        log(f"    source-fix: value confirmed '{source_now[:40]}' — done")
+                        return True
+                except Exception:
+                    pass
+                # Check if a sub-dropdown appeared (Workday sometimes has source sub-selection)
+                time.sleep(0.5)
+                sub_opts = page.locator('[role="option"]')
+                if sub_opts.count() > 0:
+                    # Sub-dropdown appeared — pick LinkedIn or first non-referral option
+                    sub_all = []
+                    for i in range(min(sub_opts.count(), 30)):
+                        opt = sub_opts.nth(i)
+                        try:
+                            if opt.is_visible():
+                                txt = opt.inner_text().strip()
+                                if txt:
+                                    sub_all.append((txt, opt))
+                        except Exception:
+                            continue
+                    if sub_all:
+                        log(f"    source-fix: sub-options: {[t for t, _ in sub_all[:5]]}")
+                        # Guard: if all sub-options look like phone codes, close and return
+                        phone_code_count = sum(1 for t, _ in sub_all if re.search(r'\(\+\d+\)', t))
+                        if phone_code_count >= len(sub_all) or (phone_code_count > 0 and len(sub_all) <= 2):
+                            log("    source-fix: sub-options are phone codes — closing dropdown")
+                            try:
+                                page.keyboard.press("Escape")
+                                time.sleep(0.3)
+                            except Exception:
+                                pass
+                            return True
+                        for kw in ["linkedin", "nb careers", "careers", "website", "job"]:
+                            for stxt, sopt in sub_all:
+                                if kw in stxt.lower():
+                                    try:
+                                        sopt.evaluate("el => el.click()")
+                                    except Exception:
+                                        sopt.click()
+                                    log(f"    source-fix: selected sub-option '{stxt}'")
+                                    time.sleep(0.5)
+                                    return True
+                        # Pick first non-referral
+                        for stxt, sopt in sub_all:
+                            if "referral" not in stxt.lower() and "employee" not in stxt.lower():
+                                try:
+                                    sopt.evaluate("el => el.click()")
+                                except Exception:
+                                    sopt.click()
+                                log(f"    source-fix: fallback sub-option '{stxt}'")
+                                time.sleep(0.5)
+                                return True
+                return True
+
+        # If no options visible yet, try typing to filter
+        for search in ["Job Posting", "Job Board", "Website", "Online"]:
+            page.keyboard.type(search[:10], delay=50)
+            time.sleep(0.8)
+            opts = page.locator('[role="option"]')
+            count = opts.count()
+            for i in range(min(count, 30)):
+                opt = opts.nth(i)
+                try:
+                    if not opt.is_visible():
+                        continue
+                    txt = opt.inner_text().strip()
+                    if search.lower() in txt.lower() or txt.lower() in search.lower():
+                        opt.click()
+                        log(f"    source-fix: typed-search selected '{txt}' for How Did You Hear About Us")
+                        time.sleep(0.5)
+                        return True
+                except Exception:
+                    continue
+            # Clear search
+            try:
+                page.keyboard.press("Control+a")
+                page.keyboard.press("Backspace")
+                time.sleep(0.3)
+            except Exception:
+                pass
+
+        page.keyboard.press("Escape")
+        return False
+    except Exception as e:
+        log(f"    source-fix error: {e}")
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False
 
 
 def _handle_captcha_via_telegram(page, company, role):
@@ -2170,6 +3244,7 @@ def apply_company(page, url, role, company, ws_profile, client):
     context = page.context
     stuck_count = 0
     prev_url = ""
+    captcha_counts = {}  # url → count of CAPTCHAs solved on that URL
 
     for page_num in range(MAX_PAGES):
         current_url = page.url
@@ -2179,21 +3254,83 @@ def apply_company(page, url, role, company, ws_profile, client):
         if is_success_page(page):
             return True, "submitted"
 
+        # Workday job listing page — click Apply and catch new tab
+        # Workday job listing URLs look like /job/City/Role_Title/REQ123
+        # (as opposed to /apply/... or /login or auth pages)
+        if is_workday_url(current_url) and re.search(r'/job/[^/]+/[^/]+', current_url):
+            page = _workday_click_apply_and_catch_tab(page, context)
+            current_url = page.url  # URL may have changed
+            prev_url = ""
+            time.sleep(2)
+            # Fall through to auth handler below
+
+        # Workday auth page handler (Create Account / Sign In loop fix)
+        # Must run BEFORE Claude call so we never waste an API call on auth pages
+        if is_workday_url(current_url):
+            if _handle_workday_auth_page(page):
+                time.sleep(2)
+                prev_url = ""  # Reset stuck detection so URL change is noticed
+                continue
+
         # Quick CAPTCHA/verification check each page
         try:
-            vis_text = page.evaluate("() => document.body.innerText.toLowerCase().slice(0, 2000)")
-            if "captcha" in vis_text or "recaptcha" in vis_text or "verify you are human" in vis_text:
+            # Use full page text (not sliced) to avoid missing messages buried below nav
+            vis_text = page.evaluate("() => document.body.innerText.toLowerCase()")
+            vis_short = vis_text[:3000]  # shorter slice for captcha checks (faster)
+
+            # Only trigger if it's an actual CAPTCHA challenge, not just a footer mention
+            real_captcha = (
+                "verify you are human" in vis_short
+                or "i'm not a robot" in vis_short
+                or "im not a robot" in vis_short
+                or ("captcha" in vis_short and any(x in vis_short for x in ["solve", "puzzle", "drag", "select all", "click all", "type the"]))
+            )
+            if real_captcha:
+                captcha_counts[current_url] = captcha_counts.get(current_url, 0) + 1
+                if captcha_counts[current_url] > 4:
+                    return False, f"CAPTCHA appeared {captcha_counts[current_url]} times on same page — giving up"
                 if TG_TOKEN and TG_CHAT:
                     solved = _handle_captcha_via_telegram(page, company, role)
                     if solved:
-                        log("  CAPTCHA solved via Telegram, continuing...")
+                        log("  CAPTCHA solved via Telegram, clicking Next...")
+                        time.sleep(2)
+                        click_next_button(page)
+                        time.sleep(4)
                         continue
                 return False, "CAPTCHA on form page"
-            if "verification code" in vis_text and "email" in vis_text and "enter" in vis_text:
-                if GMAIL_APP_PASSWORD and handle_email_verification(page):
+
+            email_verify_triggered = any(phrase in vis_text for phrase in [
+                "verification code", "verify your email", "enter the code",
+                "we sent a code", "check your email", "sent you an email",
+                "confirm your email", "activate your account", "click the link",
+                "verify your account", "please verify", "email has been sent",
+                "check the email", "open the email",
+            ])
+            # Oracle HCM: /apply/email is the EMAIL ENTRY page (not OTP) — skip it.
+            # The actual OTP page has 6 individual single-digit inputs.
+            if not email_verify_triggered and "oraclecloud.com" in page.url:
+                try:
+                    otp_inputs = page.locator('input[maxlength="1"]')
+                    if otp_inputs.count() >= 6:
+                        log("  Oracle HCM OTP page detected (6 individual digit inputs)")
+                        email_verify_triggered = True
+                except Exception:
+                    pass
+            # Workday-specific: proactively check Gmail after account creation
+            # Workday shows "check your email" but it's often in a modal/alert not in body
+            if not email_verify_triggered and is_workday_url(page.url):
+                if any(phrase in vis_text for phrase in [
+                    "account has been created", "we've sent", "email has been sent",
+                    "please check your inbox", "you will receive", "email to verify",
+                    "verification email", "account created",
+                ]):
+                    email_verify_triggered = True
+            if email_verify_triggered:
+                if handle_email_verification(page):
                     log("  Email verification completed, continuing...")
-                    continue  # Re-enter page loop
-                return False, "email verification required"
+                    time.sleep(3)
+                    continue
+                # Don't hard-fail here — let Claude try to handle the page
         except Exception:
             pass
 
@@ -2205,11 +3342,18 @@ def apply_company(page, url, role, company, ws_profile, client):
 
         time.sleep(1)
 
+        # Dismiss cookie consent banners before any other actions
+        _dismiss_cookie_banner(page)
+
         # Pre-fill: auto-click Yes/No toggles and consent checkboxes
         _auto_answer_yesno_toggles(page)
         _auto_check_consent(page)
+        _auto_fill_workable_required_radios(page)
         _auto_fill_oracle_jet_dropdowns(page)
         _auto_fill_workday_dropdowns(page)
+        _workday_fill_county_region(page)
+        _workday_fill_phone_code(page)
+        _workday_fill_source_dropdown(page)
 
         # Extract fields
         fields = extract_page_fields(page)
@@ -2221,11 +3365,19 @@ def apply_company(page, url, role, company, ws_profile, client):
             log(f"  Applying {len(cached)} cached answers")
             execute_actions(page, cached)
             time.sleep(0.5)
+            # Re-run Workday source-fix AFTER cache — cache may have overwritten the source
+            # dropdown with a value that doesn't exist in this tenant's options
+            if is_workday_url(page.url):
+                _workday_fill_phone_code(page)
+                _workday_fill_source_dropdown(page)
             # Re-extract fields to see what's left
             fields = extract_page_fields(page)
 
         # Step 2: Ask Claude to analyze page and return actions for remaining fields
-        actions = analyze_page(client, page, fields, system, role, company)
+        # Filter out multiselect search inputs that are handled by source-fix (prevent interference)
+        MULTISELECT_IDS = {"source--source"}
+        fields_for_claude = [f for f in fields if f.get("id") not in MULTISELECT_IDS]
+        actions = analyze_page(client, page, fields_for_claude, system, role, company)
         log(f"  Claude returned {len(actions)} actions")
 
         # Check for terminal actions
@@ -2233,7 +3385,22 @@ def apply_company(page, url, role, company, ws_profile, client):
             return True, "submitted"
         skip = next((a for a in actions if isinstance(a, dict) and a.get("action") == "SKIP"), None)
         if skip:
-            return False, skip.get("reason", "skipped by Claude")
+            reason = skip.get("reason", "skipped by Claude")
+            # If Claude detected a CAPTCHA, try Telegram before giving up
+            if any(w in reason.lower() for w in ["captcha", "puzzle", "verify you are human", "robot"]):
+                captcha_counts[current_url] = captcha_counts.get(current_url, 0) + 1
+                if captcha_counts[current_url] > 4:
+                    return False, f"CAPTCHA appeared {captcha_counts[current_url]} times on same page — giving up"
+                if TG_TOKEN and TG_CHAT:
+                    solved = _handle_captcha_via_telegram(page, company, role)
+                    if solved:
+                        log("  CAPTCHA solved via Telegram, clicking Next...")
+                        time.sleep(2)
+                        click_next_button(page)
+                        time.sleep(4)
+                        continue
+                return False, f"CAPTCHA detected — Telegram solve timed out: {reason}"
+            return False, reason
 
         # Execute all actions
         if actions:
@@ -2286,8 +3453,12 @@ def apply_company(page, url, role, company, ws_profile, client):
                 log(f"  Fatal error detected: {errors[0][:100]}")
                 return False, f"blocked: {errors[0][:100]}"
             log(f"  Errors: {errors[:5]} | Empty required: {empty} (retry {retry+1})")
+            # Re-run targeted fixers before asking Claude
+            _workday_fill_county_region(page)
+            _workday_fill_phone_code(page)
+            _workday_fill_source_dropdown(page)
             error_ctx = f"Validation errors: {errors}\nEmpty required fields: {empty}"
-            fields_retry = extract_page_fields(page)
+            fields_retry = [f for f in extract_page_fields(page) if f.get("id") not in MULTISELECT_IDS]
             fix_actions = analyze_page(
                 client, page, fields_retry, system, role, company,
                 error_context=error_ctx,
@@ -2306,6 +3477,9 @@ def apply_company(page, url, role, company, ws_profile, client):
             _auto_check_consent(page)
             _auto_fill_oracle_jet_dropdowns(page)
             _auto_fill_workday_dropdowns(page)
+            _workday_fill_county_region(page)
+            _workday_fill_phone_code(page)
+            _workday_fill_source_dropdown(page)
             # Check for success after navigation
             page = handle_new_tabs(page, context)
             if is_success_page(page):
@@ -2319,6 +3493,93 @@ def apply_company(page, url, role, company, ws_profile, client):
         # Stuck detection
         if current_url == prev_url:
             stuck_count += 1
+
+            # Workday-specific: if stuck on account creation page
+            if stuck_count >= 2 and is_workday_url(current_url):
+                page_lower = ""
+                try:
+                    page_lower = page.evaluate("() => document.body.innerText.toLowerCase()")
+                except Exception:
+                    pass
+
+                # On first stuck round: proactively check Gmail for verification email
+                if stuck_count == 2:
+                    log("  Workday stuck — proactively checking Gmail for verification email...")
+                    if handle_email_verification(page):
+                        log("  Workday email verification completed, continuing...")
+                        stuck_count = 0
+                        time.sleep(3)
+                        continue
+
+                # Every stuck round: try switching to Sign In if page has create account form
+                if "create account" in page_lower or "already have an account" in page_lower:
+                    log("  Workday: switching to Sign In flow...")
+                    signed_in = False
+                    for sign_in_sel in [
+                        'a:has-text("Sign In")',
+                        'button:has-text("Sign In")',
+                        '[data-automation-id="signIn"]',
+                        'a[href*="signIn"]',
+                        'a[href*="signin"]',
+                        'text=Sign In',
+                    ]:
+                        try:
+                            el = page.locator(sign_in_sel).last  # use .last to get inline link not header
+                            if el.count() > 0 and el.is_visible(timeout=1000):
+                                el.click()
+                                time.sleep(3)
+                                log("  Workday: clicked Sign In")
+                                # Fill email + last known password
+                                try:
+                                    page.fill('[data-automation-id="email"]', PROFILE["email"])
+                                    time.sleep(0.5)
+                                    # Try cached password (normalized key), fall back to default
+                                    cache = _load_answer_cache()
+                                    pwd_val = ""
+                                    for raw_key in ["password", "new password"]:
+                                        if raw_key in cache:
+                                            pwd_val = cache[raw_key].get("value", "")
+                                            break
+                                    if not pwd_val:
+                                        domain_m = re.search(r'https?://([^/]+)', page.url)
+                                        pwd_val = _workday_passwords.get(domain_m.group(1) if domain_m else "", WORKDAY_DEFAULT_PASSWORD)
+                                    page.fill('[data-automation-id="password"]', pwd_val)
+                                except Exception:
+                                    pass
+                                stuck_count = 0
+                                signed_in = True
+                                break
+                        except Exception:
+                            continue
+                    if signed_in:
+                        continue
+
+            # TAL ATS register loop: email already registered → try Sign In
+            if stuck_count == 2 and "tal.net" in current_url and "/candidate/register" in current_url:
+                log("  TAL ATS: stuck on register — trying Sign In instead...")
+                for sign_in_sel in [
+                    'a:has-text("Sign In")', 'a:has-text("Log In")', 'a:has-text("Login")',
+                    'button:has-text("Sign In")', 'a[href*="login"]', 'a[href*="signin"]',
+                ]:
+                    try:
+                        el = page.locator(sign_in_sel).first
+                        if el.count() > 0 and el.is_visible(timeout=1000):
+                            el.click()
+                            time.sleep(3)
+                            log("  TAL ATS: clicked Sign In")
+                            try:
+                                page.fill('[type="email"], [id*="email"], [name*="email"]', PROFILE["email"])
+                                page.fill('[type="password"], [id*="password"], [name*="password"]', WORKDAY_DEFAULT_PASSWORD)
+                            except Exception:
+                                pass
+                            stuck_count = 0
+                            break
+                    except Exception:
+                        continue
+
+            if stuck_count >= MAX_STUCK * 3:
+                # Absolute cap — never loop more than 3x MAX_STUCK on same URL
+                return False, f"stuck on same page for {stuck_count} rounds (gave up)"
             if stuck_count >= MAX_STUCK:
                 # Try scrolling up and looking for button we missed
                 page.evaluate("window.scrollTo(0, 0)")
@@ -2327,7 +3588,7 @@ def apply_company(page, url, role, company, ws_profile, client):
                 if not clicked:
                     return False, f"stuck on same page for {MAX_STUCK} rounds"
                 time.sleep(4)
-                stuck_count = 0
+                # Don't reset stuck_count — keep accumulating
         else:
             stuck_count = 0
         prev_url = current_url
@@ -2335,9 +3596,37 @@ def apply_company(page, url, role, company, ws_profile, client):
     return False, "max pages reached"
 
 
-def _dismiss_leave_dialogs(page):
-    """Dismiss 'Discard Application?' / 'Leave page?' dialogs."""
+def _dismiss_cookie_banner(page):
+    """Dismiss cookie consent banners (Accept/Agree/OK buttons)."""
     try:
+        for label in ["Accept all", "Accept All", "Accept", "Agree", "OK", "Allow all", "Allow All", "Got it", "I agree"]:
+            btn = page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.I))
+            if btn.count() > 0 and btn.first.is_visible():
+                btn.first.click()
+                time.sleep(0.5)
+                return
+        # Fallback: look for cookie banner by common selectors
+        for selector in ["#onetrust-accept-btn-handler", ".cookie-accept", "[id*='cookie'] button", "[class*='cookie'] button"]:
+            try:
+                el = page.locator(selector)
+                if el.count() > 0 and el.first.is_visible():
+                    el.first.click()
+                    time.sleep(0.5)
+                    return
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def _dismiss_leave_dialogs(page):
+    """Dismiss 'Discard Application?' / 'Leave page?' dialogs.
+    Also blocks 'Use My Last Application' (Workday) which would overwrite our profile."""
+    try:
+        # Workday: block "Use My Last Application" / "Autofill with Resume" dialog
+        if is_workday_url(page.url):
+            _workday_dismiss_autofill_now(page)
+
         dialog = page.locator('[role="dialog"], .modal, [class*="modal"]')
         if dialog.count() == 0:
             return
@@ -2364,6 +3653,723 @@ def _dismiss_leave_dialogs(page):
         pass
 
 
+_workday_auth_state = {}  # domain → {"signin_attempts": int, "created": bool}
+_workday_apply_clicked = set()  # URLs where Apply was already clicked (avoid double-click)
+
+
+def _workday_dismiss_autofill_now(page):
+    """Immediately dismiss Workday's 'autofill with resume' / 'use my last application' prompt.
+    Called right when the in-page form is detected, while the prompt is still visible."""
+    try:
+        # First, dump all visible buttons to understand what's on the page
+        btns_debug = page.evaluate("""() => {
+            const all = [...document.querySelectorAll('button, [role="button"]')];
+            return all
+                .filter(b => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+                .map(b => (b.innerText || b.textContent || '').trim().substring(0, 50));
+        }""")
+        log(f"  Workday autofill: visible buttons = {btns_debug[:10]}")
+
+        clicked = page.evaluate("""() => {
+            const bodyText = document.body.innerText.toLowerCase();
+            const hasPrompt = bodyText.includes('use my last application') ||
+                              bodyText.includes('autofill with resume') ||
+                              bodyText.includes('autofill with');
+            if (!hasPrompt) return null;
+            // Find the "skip autofill" button — must NOT be the autofill button itself
+            const blockWords = ['autofill', 'resume', 'last application', 'main content',
+                                'navigation', 'skip to', 'upload'];
+            const prefer = [
+                'apply manually', 'enter manually', 'fill out manually', 'fill manually',
+                'fill in manually', 'no, thanks', 'no thanks', 'decline',
+                'start fresh', 'start from scratch',
+            ];
+            const all = [
+                ...document.querySelectorAll('button'),
+                ...document.querySelectorAll('[role="button"]'),
+            ];
+            for (const label of prefer) {
+                const el = all.find(b => {
+                    const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                    if (blockWords.some(sw => t.includes(sw))) return false;
+                    return t === label || t.startsWith(label);
+                });
+                if (el) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {
+                        el.click();
+                        return (el.innerText || el.textContent || '').trim();
+                    }
+                }
+            }
+            return 'prompt-found-no-button';
+        }""")
+        if clicked and clicked != 'prompt-found-no-button':
+            log(f"  Workday autofill prompt: dismissed via '{clicked}'")
+            time.sleep(2)  # Wait for SPA transition after dismissal
+        elif clicked == 'prompt-found-no-button':
+            log("  Workday autofill prompt: visible but no dismiss button found")
+        # else: no prompt present
+    except Exception as e:
+        log(f"  Workday autofill prompt dismiss error: {e}")
+
+
+def _workday_click_apply_and_catch_tab(page, context):
+    """On a Workday job listing page, click Apply and catch the resulting new tab.
+    Returns the new page (auth/apply form) or the original page if nothing opened."""
+    current_url = page.url
+    if current_url in _workday_apply_clicked:
+        return page  # Already successfully handled Apply here
+
+    # Check if there's an Apply button visible
+    apply_btn = None
+    for sel in [
+        '[data-automation-id="jobPostingApplyButton"]',
+        '[data-automation-id="jobApplyButton"]',
+        '[data-automation-id="applyButton"]',
+        'a[data-automation-id="jobAction"]',
+        'button[data-automation-id="Apply"]',
+        'a[aria-label="Apply"]',
+        'button[aria-label="Apply"]',
+    ]:
+        btn = page.locator(sel)
+        if btn.count() > 0:
+            try:
+                if btn.first.is_visible(timeout=1000):
+                    apply_btn = btn.first
+                    break
+            except Exception:
+                pass
+
+    if not apply_btn:
+        # Try by role/text (allow partial match for "Apply Now", "Apply for this job", etc.)
+        for label in ["Apply", "Apply Now"]:
+            btn = page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.I))
+            if btn.count() > 0:
+                try:
+                    if btn.first.is_visible(timeout=500):
+                        apply_btn = btn.first
+                        break
+                except Exception:
+                    pass
+        if not apply_btn:
+            # Try link with Apply text as last resort
+            for lnk_sel in ['a:has-text("Apply")', 'a:has-text("Apply Now")']:
+                try:
+                    btn = page.locator(lnk_sel).first
+                    if btn.is_visible(timeout=500):
+                        apply_btn = btn
+                        break
+                except Exception:
+                    pass
+
+    if not apply_btn:
+        log("  Workday: no Apply button found on job listing page (skipping)")
+        return page  # No Apply button found on this page
+
+    log("  Workday: clicking Apply button on job listing page...")
+
+    # Playwright .click() selectors to try (ordered by specificity)
+    # IMPORTANT: must use Playwright's .click() not page.evaluate(el.click) —
+    # only real user gestures open target=_blank new tabs (popup-blocked otherwise)
+    click_selectors = [
+        '[data-automation-id="jobPostingApplyButton"]',
+        '[data-automation-id="jobApplyButton"]',
+        '[data-automation-id="applyButton"]',
+        '[data-automation-id="applyNowButton"]',
+        'a[aria-label="Apply"]',
+        'button[aria-label="Apply"]',
+    ]
+
+    def _try_playwright_click():
+        """Try clicking Apply with each selector; return True on first success."""
+        for sel in click_selectors:
+            try:
+                loc = page.locator(sel).first
+                if page.locator(sel).count() > 0 and loc.is_visible(timeout=500):
+                    loc.click(timeout=5000)
+                    log(f"  Workday Apply: clicked via {sel}")
+                    return True
+            except Exception:
+                continue
+        # Last resort: find by text
+        for text_sel in ['a:has-text("Apply")', 'button:has-text("Apply")']:
+            try:
+                loc = page.locator(text_sel).first
+                if page.locator(text_sel).count() > 0 and loc.is_visible(timeout=500):
+                    loc.click(timeout=5000)
+                    log(f"  Workday Apply: clicked via text match")
+                    return True
+            except Exception:
+                continue
+        return False
+
+    # Method 1: Playwright click with new-tab detection
+    try:
+        with context.expect_page(timeout=10000) as new_page_info:
+            if not _try_playwright_click():
+                log("  Workday: no Apply selector matched (no new-tab attempt)")
+                raise Exception("no selector matched")
+        new_page = new_page_info.value
+        # Wait for URL to resolve (not about:blank)
+        for _ in range(20):
+            if new_page.url not in ("about:blank", ""):
+                break
+            time.sleep(0.5)
+        try:
+            new_page.wait_for_load_state("domcontentloaded", timeout=12000)
+        except Exception:
+            pass
+        log(f"  Workday: Apply opened new tab → {new_page.url[:80]}")
+        Stealth().apply_stealth_sync(new_page)
+        _workday_apply_clicked.add(current_url)
+        try:
+            page.close()
+        except Exception:
+            pass
+        return new_page
+    except Exception:
+        pass
+
+    # Check if Apply opened an in-page form BEFORE method-2 re-click
+    # Uses DOM-based detection (not text) to avoid false positives from job description
+    def _in_page_form_open():
+        try:
+            reason = page.evaluate("""() => {
+                const bodyText = document.body.innerText.toLowerCase();
+                if (document.querySelector('[role="dialog"][aria-modal="true"]'))
+                    return 'dialog-modal';
+                if (document.querySelector('[data-automation-id="dialog"]'))
+                    return 'wd-dialog';
+                if (document.querySelector('[data-automation-id="formContainer"]'))
+                    return 'wd-formContainer';
+                if (document.querySelector('[data-automation-id="signInSubmitButton"]'))
+                    return 'wd-signIn-btn';
+                if (document.querySelector('[data-automation-id="createAccountSubmitButton"]'))
+                    return 'wd-createAccount-btn';
+                // Workday autofill prompt text
+                if (bodyText.includes('use my last application') || bodyText.includes('autofill with resume'))
+                    return 'autofill-text';
+                // Visible password/email inputs (auth form in overlay)
+                const inputs = document.querySelectorAll('input[type="password"], input[type="email"]');
+                const hasAuthInputs = [...inputs].some(el => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                });
+                if (hasAuthInputs) return 'auth-inputs';
+                return null;
+            }""")
+            if reason:
+                log(f"  Workday: in-page form detected: {reason}")
+                return True
+            return False
+        except Exception:
+            return False
+
+    if _in_page_form_open():
+        log("  Workday: Apply opened in-page form (detected after method-1)")
+        _workday_dismiss_autofill_now(page)
+        _workday_apply_clicked.add(current_url)
+        return page
+
+    # Method 2: Same-tab navigation (some Workday tenants navigate in-page)
+    try:
+        _try_playwright_click()
+        time.sleep(3)
+        if page.url != current_url:
+            log(f"  Workday: Apply navigated same tab → {page.url[:80]}")
+            _workday_apply_clicked.add(current_url)
+            return page
+        # Check if a new tab appeared anyway (sometimes context.expect_page misses)
+        new_tabs = [p for p in context.pages if p != page and not p.is_closed()]
+        if new_tabs:
+            nt = new_tabs[-1]
+            for _ in range(16):
+                if nt.url not in ("about:blank", ""):
+                    break
+                time.sleep(0.5)
+            if nt.url not in ("about:blank", "") and "linkedin.com" not in nt.url:
+                log(f"  Workday: Apply opened tab (method 2) → {nt.url[:80]}")
+                Stealth().apply_stealth_sync(nt)
+                _workday_apply_clicked.add(current_url)
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                return nt
+    except Exception as e:
+        log(f"  Workday: Apply click error: {e}")
+
+    # Method 3: Check if Apply opened a dialog/auth form after method-2 click
+    if _in_page_form_open():
+        log("  Workday: Apply opened in-page form/dialog (method-3 check)")
+        _workday_dismiss_autofill_now(page)
+        _workday_apply_clicked.add(current_url)
+        return page
+
+    log("  Workday: Apply click did not navigate — will retry on next iteration")
+    return page
+
+
+def _workday_click_signin_button(page):
+    """Click the Sign In submit button. Returns True if clicked."""
+    # First try clicking the click_filter overlay div (Workday's custom button)
+    for aria_label in ["Sign In", "sign in"]:
+        overlay = page.locator(f'[data-automation-id="click_filter"][aria-label="{aria_label}"]')
+        if overlay.count() > 0:
+            try:
+                overlay.first.evaluate("el => el.click()")
+                time.sleep(4)
+                log(f"  Workday auth: clicked Sign In via click_filter overlay")
+                return True
+            except Exception:
+                pass
+    for btn_sel in [
+        '[data-automation-id="signInSubmitButton"]',
+        '[data-automation-id="submitButton"]',
+    ]:
+        btn = page.locator(btn_sel)
+        if btn.count() > 0:
+            try:
+                btn.first.evaluate("el => el.click()")
+                time.sleep(4)
+                log(f"  Workday auth: JS-clicked Sign In via {btn_sel}")
+                return True
+            except Exception:
+                pass
+    btn = page.get_by_role("button", name=re.compile(r"^sign.?in$", re.I))
+    if btn.count() > 0:
+        try:
+            btn.first.evaluate("el => el.click()")
+            time.sleep(4)
+            log("  Workday auth: JS-clicked Sign In button (role match)")
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _handle_workday_auth_page(page):
+    """Handle Workday Create Account / Sign In pages without going through Claude.
+    Called at the top of each loop iteration when URL contains myworkdayjobs.com.
+
+    Flow:
+      - Create Account page (first time) → click Sign In link (try existing account)
+      - Sign In page → fill credentials and submit
+      - Sign In fails (wrong password / no account) → go to Create Account, fill all fields
+      - Create Account filled → submit → triggers email verification
+      - Email verification → open Gmail → click link → continue
+
+    Returns True if the page was handled (caller should `continue`), False otherwise.
+    """
+    try:
+        page_text = page.evaluate("() => document.body.innerText")
+    except Exception:
+        return False
+    page_lower = page_text.lower()
+
+    # Only act when we're clearly on an auth page
+    is_auth = any(x in page_lower for x in [
+        "create account", "already have an account",
+        "don't have an account", "create your workday account",
+    ])
+
+    # Also check for a standalone visible password input (Sign In page marker)
+    try:
+        has_visible_password = page.evaluate("""() => {
+            const pwds = document.querySelectorAll('input[type="password"]');
+            return [...pwds].some(el => {
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            });
+        }""")
+    except Exception:
+        has_visible_password = False
+
+    if not is_auth and not has_visible_password:
+        return False
+
+    # Get domain key for state tracking
+    domain_match = re.search(r'https?://([^/]+)', page.url)
+    domain_key = domain_match.group(1) if domain_match else "workday"
+    state = _workday_auth_state.setdefault(domain_key, {"signin_attempts": 0, "created": False})
+
+    # Determine page type: Create Account has "verify new password" / "confirm password"
+    is_create_account_page = any(x in page_lower for x in [
+        "verify new password", "confirm password", "confirm new password",
+        "retype password", "create your workday account",
+    ])
+
+    # ----------------------------------------------------------------
+    # CREATE ACCOUNT PAGE
+    # ----------------------------------------------------------------
+    if is_create_account_page:
+        # If Sign In has already failed (no account / wrong pw), fill Create Account form
+        if state["signin_attempts"] >= 2 and not state["created"]:
+            log("  Workday auth: Sign In failed — filling Create Account form")
+            return _workday_fill_create_account(page, domain_key, state)
+
+        # First visit to Create Account: try Sign In link (account may already exist)
+        log("  Workday auth: Create Account page — trying Sign In first")
+        for sel in [
+            'a:has-text("Sign In")',
+            '[data-automation-id="signIn"]',
+            'a[href*="signIn"]',
+            'a[href*="signin"]',
+        ]:
+            try:
+                els = page.locator(sel)
+                for i in range(min(els.count(), 5)):
+                    el = els.nth(i)
+                    try:
+                        if el.is_visible(timeout=500):
+                            el.click()
+                            time.sleep(2)
+                            log("  Workday auth: clicked Sign In link")
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        # Couldn't find Sign In link — fill Create Account now
+        log("  Workday auth: no Sign In link found — filling Create Account")
+        return _workday_fill_create_account(page, domain_key, state)
+
+    # ----------------------------------------------------------------
+    # SIGN IN PAGE (has visible password input + sign-in text)
+    # ----------------------------------------------------------------
+    if not has_visible_password:
+        return False
+
+    has_signin_label = "sign in" in page_lower or "log in" in page_lower
+    if not has_signin_label:
+        return False
+
+    # If we've created an account but sign-in still fails, check Gmail for verification email
+    if state["signin_attempts"] >= 2 and state["created"]:
+        log(f"  Workday auth: account created but sign-in failing — checking Gmail for verification link")
+        # Directly check Gmail for a Workday verification email (don't rely on page text)
+        try:
+            body_text, body_html, gmail_tab = _open_gmail_and_find_email(page, wait_seconds=20)
+            # IMAP fallback if browser Gmail is not logged in
+            if not body_html and GMAIL_APP_PASSWORD:
+                log("  Workday auth: browser Gmail unavailable — trying IMAP...")
+                body_text, body_html = _fetch_gmail_body_imap(wait_seconds=5)
+            if body_html:
+                link_patterns = [
+                    r'href=["\']?(https?://[^"\'>\s]+(?:verif|confirm|activat|reset|token)[^"\'>\s]*)',
+                    r'href=["\']?(https?://[^"\'>\s]+workday[^"\'>\s]*)',
+                ]
+                verify_link = None
+                for pat in link_patterns:
+                    m = re.search(pat, body_html, re.I)
+                    if m:
+                        verify_link = m.group(1).rstrip('.')
+                        break
+                if verify_link:
+                    log(f"  Workday auth: clicking verification link from Gmail")
+                    verify_tab = page.context.new_page()
+                    try:
+                        verify_tab.goto(verify_link, wait_until="domcontentloaded", timeout=20000)
+                        time.sleep(3)
+                        log(f"  Workday auth: verification link opened → {verify_tab.url[:80]}")
+                        verify_tab.close()
+                        if gmail_tab:
+                            try: gmail_tab.close()
+                            except: pass
+                        state["signin_attempts"] = 0  # Reset so next iteration tries sign-in fresh
+                        # Reload so we get the Sign In page instead of "check your email"
+                        try:
+                            page.reload(wait_until="domcontentloaded", timeout=15000)
+                            time.sleep(2)
+                        except Exception:
+                            pass
+                        return True
+                    except Exception as e:
+                        log(f"  Workday auth: verification link error: {e}")
+                        try: verify_tab.close()
+                        except: pass
+                else:
+                    log("  Workday auth: no verification link found in Gmail")
+                if gmail_tab:
+                    try: gmail_tab.close()
+                    except: pass
+            else:
+                log("  Workday auth: Gmail returned no email body")
+        except Exception as e:
+            log(f"  Workday auth: Gmail check error: {e}")
+        # If verification failed, mark for manual intervention but don't loop infinitely
+        if state["signin_attempts"] >= 8:
+            log("  Workday auth: too many sign-in attempts with no verification — giving up")
+            return False
+        return True  # Let next iteration try sign-in again after verification
+
+    # If we've already tried signing in 2+ times without account creation, navigate to Create Account
+    if state["signin_attempts"] >= 2 and not state["created"]:
+        log(f"  Workday auth: Sign In failed {state['signin_attempts']} times — switching to Create Account")
+        # Try to find and click "Create Account" / "Don't have an account" link
+        navigated = False
+        for sel in [
+            'a:has-text("Create Account")',
+            'a:has-text("Don\'t have an account")',
+            '[data-automation-id="createAccount"]',
+            'a[href*="createAccount"]',
+            'a[href*="register"]',
+            'button:has-text("Create Account")',
+        ]:
+            try:
+                els = page.locator(sel)
+                for i in range(min(els.count(), 3)):
+                    el = els.nth(i)
+                    if el.is_visible(timeout=500):
+                        el.evaluate("el => el.click()")
+                        time.sleep(2)
+                        log(f"  Workday auth: clicked Create Account link via {sel}")
+                        navigated = True
+                        break
+                if navigated:
+                    break
+            except Exception:
+                continue
+        # If can't find link, try JS to trigger Create Account page via URL manipulation
+        if not navigated:
+            log("  Workday auth: no Create Account link — filling form directly")
+            return _workday_fill_create_account(page, domain_key, state)
+        return True  # Let next iteration handle the Create Account page
+
+    # Get password to try — ALWAYS use OpenClaw default for nb.wd1 (not Moelis cache)
+    password = _workday_passwords.get(domain_key, "")
+    # If we haven't set a password for this domain yet, use the default (not the cache)
+    if not password:
+        password = WORKDAY_DEFAULT_PASSWORD
+    # Only fall back to cache if default is somehow empty
+    if not password:
+        cache = _load_answer_cache()
+        password = (
+            cache.get("password", {}).get("value", "")
+            or cache.get("new password", {}).get("value", "")
+        )
+
+    log(f"  Workday auth: Sign In page — attempt {state['signin_attempts']+1}, pw='{password[:8]}...'")
+
+    try:
+        # Fill email
+        for email_sel in [
+            '[data-automation-id="email"]',
+            'input[type="email"]',
+            'input[name="username"]',
+            'input[name="email"]',
+        ]:
+            el = page.locator(email_sel)
+            if el.count() > 0 and el.first.is_visible(timeout=1000):
+                el.first.fill(PROFILE["email"])
+                break
+        time.sleep(0.3)
+
+        # Fill password
+        for pwd_sel in [
+            '[data-automation-id="password"]',
+            'input[type="password"]',
+            'input[name="password"]',
+        ]:
+            el = page.locator(pwd_sel)
+            if el.count() > 0 and el.first.is_visible(timeout=1000):
+                el.first.fill(password)
+                break
+        time.sleep(0.3)
+
+        clicked = _workday_click_signin_button(page)
+        if not clicked:
+            log("  Workday auth: couldn't find Sign In button")
+            return False
+
+        state["signin_attempts"] += 1
+
+        # Wait a bit then check outcome
+        time.sleep(3)
+        new_text = ""
+        try:
+            new_text = page.evaluate("() => document.body.innerText.toLowerCase()")
+        except Exception:
+            pass
+
+        signin_error = any(x in new_text for x in [
+            "incorrect", "invalid credentials", "not found", "wrong password",
+            "does not match", "no account", "we couldn't find",
+            "account does not exist", "your password is incorrect",
+            "password you entered", "invalid username", "couldn't find",
+        ])
+
+        # Also check if still on sign-in page after submit (URL unchanged = failure)
+        still_signin = has_visible_password and ("sign in" in new_text or "log in" in new_text)
+        if still_signin and state["signin_attempts"] >= 1:
+            # Password might be wrong — mark as error
+            log(f"  Workday auth: still on Sign In page after submit — password likely wrong")
+            signin_error = True
+
+        if signin_error:
+            log(f"  Workday auth: Sign In failed (attempt {state['signin_attempts']})")
+            # On second failure immediately switch to Create Account on next iteration
+            if state["signin_attempts"] >= 2:
+                log("  Workday auth: will create new account on next iteration")
+
+        # Check if email verification needed after successful sign-in
+        if any(x in new_text for x in ["verify your email", "check your email", "verification"]):
+            log("  Workday auth: email verification needed after sign-in")
+            if handle_email_verification(page):
+                log("  Workday auth: email verified successfully")
+
+        return True
+
+    except Exception as e:
+        log(f"  Workday auth: error during sign-in: {e}")
+        return False
+
+
+def _workday_fill_create_account(page, domain_key, state):
+    """Fill and submit the Workday Create Account form."""
+    password = WORKDAY_DEFAULT_PASSWORD
+    _workday_passwords[domain_key] = password  # Remember for Sign In after verification
+
+    try:
+        # Email
+        for sel in ['[data-automation-id="email"]', 'input[type="email"]', 'input[name="email"]']:
+            el = page.locator(sel)
+            if el.count() > 0 and el.first.is_visible(timeout=1000):
+                el.first.fill(PROFILE["email"])
+                break
+        time.sleep(0.3)
+
+        # Password
+        for sel in ['[data-automation-id="password"]', 'input[type="password"][name*="password"]',
+                    'input[type="password"]']:
+            els = page.locator(sel)
+            # Fill first visible password field (new password), then second (verify)
+            visible = [els.nth(i) for i in range(els.count()) if els.nth(i).is_visible(timeout=300)]
+            if visible:
+                visible[0].fill(password)
+                if len(visible) > 1:
+                    visible[1].fill(password)  # Verify New Password
+                break
+        time.sleep(0.3)
+
+        # Alternatively fill by label selectors
+        for verify_sel in [
+            '[data-automation-id="verifyPassword"]',
+            'input[name*="verify"]',
+            'input[name*="confirm"]',
+        ]:
+            el = page.locator(verify_sel)
+            if el.count() > 0 and el.first.is_visible(timeout=500):
+                el.first.fill(password)
+                break
+        time.sleep(0.3)
+
+        # Tick "I acknowledge" / privacy notice checkbox (required on some Workday tenants)
+        for ack_sel in [
+            '[data-automation-id="createAccountAgreement"]',
+            'input[type="checkbox"][id*="acknowledge"]',
+            'input[type="checkbox"][id*="agree"]',
+            'input[type="checkbox"][id*="privacy"]',
+            'input[type="checkbox"][id*="terms"]',
+        ]:
+            el = page.locator(ack_sel)
+            if el.count() > 0 and el.first.is_visible(timeout=500):
+                if not el.first.is_checked():
+                    el.first.check()
+                    log("  Workday auth: ticked 'I acknowledge' checkbox")
+                break
+        # Fallback: find any unchecked checkbox near text "acknowledge" or "agree"
+        try:
+            ack_boxes = page.locator('input[type="checkbox"]')
+            for i in range(ack_boxes.count()):
+                box = ack_boxes.nth(i)
+                if box.is_visible(timeout=300) and not box.is_checked():
+                    label_text = ""
+                    try:
+                        label_text = box.evaluate("""el => {
+                            const lbl = el.closest('label') || document.querySelector('label[for="'+el.id+'"]');
+                            return lbl ? lbl.innerText.toLowerCase() : '';
+                        }""")
+                    except Exception:
+                        pass
+                    if any(w in label_text for w in ["acknowledge", "agree", "privacy", "terms"]):
+                        box.check()
+                        log("  Workday auth: ticked acknowledgement checkbox via fallback")
+                        break
+        except Exception:
+            pass
+        time.sleep(0.3)
+
+        # Click Create Account button — use JS click to bypass click_filter overlay
+        clicked_create = False
+        # First try the click_filter overlay div (Workday's custom button layer)
+        for aria_label in ["Create Account", "create account"]:
+            overlay = page.locator(f'[data-automation-id="click_filter"][aria-label="{aria_label}"]')
+            if overlay.count() > 0:
+                try:
+                    overlay.first.evaluate("el => el.click()")
+                    state["created"] = True
+                    clicked_create = True
+                    log("  Workday auth: JS-clicked Create Account via click_filter overlay")
+                    time.sleep(4)
+                    break
+                except Exception:
+                    pass
+        if not clicked_create:
+            for btn_sel in [
+                '[data-automation-id="createAccountSubmitButton"]',
+                '[data-automation-id="createAccount"]',
+                'button:has-text("Create Account")',
+            ]:
+                btn = page.locator(btn_sel)
+                if btn.count() > 0:
+                    try:
+                        btn.first.evaluate("el => el.click()")
+                        state["created"] = True
+                        clicked_create = True
+                        log(f"  Workday auth: JS-clicked Create Account via {btn_sel}")
+                        time.sleep(4)
+                        break
+                    except Exception:
+                        pass
+        if not clicked_create:
+            btn = page.get_by_role("button", name=re.compile(r"create.?account", re.I))
+            if btn.count() > 0:
+                try:
+                    btn.first.evaluate("el => el.click()")
+                    state["created"] = True
+                    log("  Workday auth: JS-clicked Create Account (role match)")
+                    time.sleep(4)
+                except Exception:
+                    pass
+
+        # Check for email verification message
+        try:
+            page_after = page.evaluate("() => document.body.innerText.toLowerCase()")
+            if any(x in page_after for x in ["check your email", "verify your email", "sent you an email"]):
+                log("  Workday auth: account created — email verification needed")
+                if handle_email_verification(page):
+                    log("  Workday auth: email verified — reloading to Sign In page")
+                    state["signin_attempts"] = 0  # Reset so Sign In will work
+                    # After verification the Workday page needs a reload / navigation
+                    # to show the Sign In form (original page still shows "check your email")
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=15000)
+                        time.sleep(2)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return True
+
+    except Exception as e:
+        log(f"  Workday auth: error during Create Account: {e}")
+        return False
+
+
 # =============================================================================
 #  EMAIL VERIFICATION CODE READER (Oracle HCM, SuccessFactors, etc.)
 # =============================================================================
@@ -2371,15 +4377,160 @@ def _dismiss_leave_dialogs(page):
 GMAIL_USER = PROFILE["email"]
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 
+
+def _open_gmail_and_find_email(page, wait_seconds=20):
+    """Open Gmail in a new tab using the existing logged-in browser session.
+    Searches for recent verification/confirm emails.
+    Returns (body_text, body_html, gmail_tab) or (None, None, None)."""
+    context = page.context
+    gmail_tab = None
+    try:
+        time.sleep(min(wait_seconds, 15))
+        gmail_tab = context.new_page()
+        gmail_tab.goto("https://mail.google.com/mail/u/0/#inbox",
+                       wait_until="domcontentloaded", timeout=20000)
+        time.sleep(3)
+
+        if "accounts.google" in gmail_tab.url or "signin" in gmail_tab.url:
+            log("  email-verify: Gmail not logged in — attempting auto sign-in...")
+            try:
+                # Fill email
+                email_el = gmail_tab.locator('input[type="email"]')
+                if email_el.count() > 0 and email_el.first.is_visible(timeout=3000):
+                    email_el.first.fill(PROFILE["email"])
+                    gmail_tab.keyboard.press("Enter")
+                    time.sleep(2)
+                # Fill password
+                pwd_el = gmail_tab.locator('input[type="password"]')
+                if pwd_el.count() > 0 and pwd_el.first.is_visible(timeout=5000):
+                    pwd_el.first.fill("11Musya11!")
+                    gmail_tab.keyboard.press("Enter")
+                    time.sleep(4)
+                # Check if now logged in
+                if "accounts.google" in gmail_tab.url or "signin" in gmail_tab.url:
+                    log("  email-verify: Gmail auto sign-in failed — skipping browser method")
+                    gmail_tab.close()
+                    return None, None, None
+                log("  email-verify: Gmail auto sign-in succeeded")
+            except Exception as e:
+                log(f"  email-verify: Gmail sign-in error: {e}")
+                gmail_tab.close()
+                return None, None, None
+
+        search_terms = ["verify", "verification", "confirm your", "activate", "code"]
+        for term in search_terms:
+            try:
+                sb = gmail_tab.locator('input[aria-label="Search mail"]')
+                if not sb.is_visible(timeout=3000):
+                    break
+                sb.fill(term)
+                gmail_tab.keyboard.press("Enter")
+                time.sleep(2)
+
+                # Try unread first, then any
+                for row_sel in ['tr.zA.zE', 'tr.zA']:
+                    first = gmail_tab.locator(row_sel).first
+                    if first.count() > 0 and first.is_visible(timeout=1500):
+                        first.click()
+                        time.sleep(2)
+                        body_el = gmail_tab.locator('div.a3s')
+                        if body_el.count() > 0:
+                            body_text = body_el.first.inner_text()
+                            body_html = body_el.first.inner_html()
+                            log(f"  email-verify: found email matching '{term}'")
+                            return body_text, body_html, gmail_tab
+                        break
+            except Exception:
+                continue
+
+        gmail_tab.close()
+        return None, None, None
+    except Exception as e:
+        log(f"  email-verify browser error: {e}")
+        if gmail_tab:
+            try:
+                gmail_tab.close()
+            except Exception:
+                pass
+        return None, None, None
+
+
+def _fetch_gmail_body_imap(wait_seconds=20):
+    """Fetch the most recent verification/confirm email body via IMAP.
+    Returns (body_text, body_html) or (None, None) if unavailable."""
+    if not GMAIL_APP_PASSWORD:
+        return None, None
+    try:
+        time.sleep(min(wait_seconds, 15))
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        mail.select("inbox")
+        msg_id = None
+        for search_q in [
+            '(UNSEEN FROM "eno.fa.sender")',
+            '(UNSEEN FROM "oracle")',
+            '(UNSEEN SUBJECT "verif")',
+            '(UNSEEN SUBJECT "confirm")',
+            '(UNSEEN SUBJECT "activat")',
+            '(UNSEEN SUBJECT "workday")',
+        ]:
+            _, data = mail.search(None, search_q)
+            if data[0]:
+                ids = data[0].split()
+                if ids:
+                    msg_id = ids[-1]
+                    break
+        if not msg_id:
+            # also try read emails from last 5 minutes
+            import datetime
+            since = (datetime.datetime.now() - datetime.timedelta(minutes=5)).strftime("%d-%b-%Y")
+            for search_q in [
+                f'(SINCE "{since}" FROM "eno.fa.sender")',
+                f'(SINCE "{since}" FROM "oracle")',
+                f'(SINCE "{since}" SUBJECT "verif")',
+                f'(SINCE "{since}" SUBJECT "confirm")',
+                f'(SINCE "{since}" SUBJECT "activat")',
+                f'(SINCE "{since}" SUBJECT "workday")',
+            ]:
+                _, data = mail.search(None, search_q)
+                if data[0]:
+                    ids = data[0].split()
+                    if ids:
+                        msg_id = ids[-1]
+                        break
+        if not msg_id:
+            mail.logout()
+            return None, None
+        _, msg_data = mail.fetch(msg_id, "(RFC822)")
+        msg = email_lib.message_from_bytes(msg_data[0][1])
+        mail.logout()
+        body_text, body_html = "", ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                payload = part.get_payload(decode=True)
+                if payload:
+                    decoded = payload.decode(errors="ignore")
+                    if ct == "text/plain" and not body_text:
+                        body_text = decoded
+                    elif ct == "text/html" and not body_html:
+                        body_html = decoded
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                body_text = payload.decode(errors="ignore")
+        return body_text or None, body_html or None
+    except Exception as e:
+        log(f"  email-verify IMAP body error: {e}")
+        return None, None
+
+
 def fetch_verification_code(wait_seconds=45, max_age_seconds=120):
     """Check Gmail IMAP for a recent verification code email.
-    Returns the code string or None if not found.
-    Supports Oracle HCM, SuccessFactors, Workday, and generic OTP patterns."""
+    Returns the code string or None if not found."""
     if not GMAIL_APP_PASSWORD:
-        log("  email-verify: GMAIL_APP_PASSWORD not set, skipping")
         return None
 
-    # Wait a bit for the email to arrive
     time.sleep(min(wait_seconds, 15))
 
     for attempt in range(3):
@@ -2388,82 +4539,56 @@ def fetch_verification_code(wait_seconds=45, max_age_seconds=120):
             mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
             mail.select("inbox")
 
-            # Search for recent emails with verification-related subjects
-            _, data = mail.search(None, '(UNSEEN SUBJECT "verification")')
-            if not data[0]:
-                _, data = mail.search(None, '(UNSEEN SUBJECT "code")')
-            if not data[0]:
-                _, data = mail.search(None, '(UNSEEN SUBJECT "verify")')
-            if not data[0]:
-                _, data = mail.search(None, '(UNSEEN SUBJECT "OTP")')
+            data = (None, [b""])
+            # Oracle HCM sends from eno.fa.sender@workflow.mail.us2.cloud.oracle.com
+            for search_query in [
+                '(UNSEEN FROM "eno.fa.sender")',
+                '(UNSEEN FROM "oracle")',
+                '(UNSEEN SUBJECT "verification")',
+                '(UNSEEN SUBJECT "code")',
+                '(UNSEEN SUBJECT "verify")',
+                '(UNSEEN SUBJECT "OTP")',
+                '(UNSEEN SUBJECT "confirm")',
+            ]:
+                _, data = mail.search(None, search_query)
+                if data[0]:
+                    break
 
-            ids = data[0].split()
+            ids = data[0].split() if data[0] else []
             if not ids:
                 mail.logout()
                 if attempt < 2:
-                    log(f"  email-verify: no verification email yet, waiting... (attempt {attempt+1})")
                     time.sleep(10)
                     continue
                 return None
 
-            # Get the most recent email
             _, msg_data = mail.fetch(ids[-1], "(RFC822)")
-            raw_email = msg_data[0][1]
-            msg = email_lib.message_from_bytes(raw_email)
+            msg = email_lib.message_from_bytes(msg_data[0][1])
 
-            # Check age
-            date_str = msg.get("Date", "")
-            try:
-                from email.utils import parsedate_to_datetime
-                msg_date = parsedate_to_datetime(date_str)
-                age = (datetime.now(msg_date.tzinfo) - msg_date).total_seconds()
-                if age > max_age_seconds:
-                    log(f"  email-verify: email too old ({int(age)}s)")
-                    mail.logout()
-                    return None
-            except Exception:
-                pass  # Can't parse date, try anyway
-
-            # Extract body
             body = ""
             if msg.is_multipart():
                 for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
+                    if part.get_content_type() in ("text/plain", "text/html"):
                         body = part.get_payload(decode=True).decode(errors="ignore")
                         break
-                    elif part.get_content_type() == "text/html":
-                        body = part.get_payload(decode=True).decode(errors="ignore")
             else:
                 body = msg.get_payload(decode=True).decode(errors="ignore")
 
-            # Extract verification code — try common patterns
-            code = None
-            # Pattern 1: "verification code is 123456" or "code: 123456"
-            m = re.search(r'(?:verification|security|confirm)\s*(?:code|number|pin)\s*(?:is|:)?\s*(\d{4,8})', body, re.I)
-            if m:
-                code = m.group(1)
-            # Pattern 2: Standalone 6-digit code (most common)
-            if not code:
-                m = re.search(r'\b(\d{6})\b', body)
-                if m:
-                    code = m.group(1)
-            # Pattern 3: 4-digit OTP
-            if not code:
-                m = re.search(r'\b(\d{4})\b', body)
-                if m:
-                    code = m.group(1)
-
             mail.logout()
 
-            if code:
-                log(f"  email-verify: found code {code}")
-                return code
-            else:
-                log(f"  email-verify: email found but no code extracted")
-                return None
+            m = re.search(r'(?:verification|security|confirm)\s*(?:code|number|pin)\s*(?:is|:)?\s*(\d{4,8})', body, re.I)
+            if m:
+                return m.group(1)
+            m = re.search(r'\b(\d{6})\b', body)
+            if m:
+                return m.group(1)
+            m = re.search(r'\b(\d{4})\b', body)
+            if m:
+                return m.group(1)
+            return None
 
         except Exception as e:
-            log(f"  email-verify error: {e}")
+            log(f"  email-verify IMAP error: {e}")
             if attempt < 2:
                 time.sleep(5)
 
@@ -2472,36 +4597,153 @@ def fetch_verification_code(wait_seconds=45, max_age_seconds=120):
 
 def handle_email_verification(page):
     """Detect and handle email verification pages.
-    Returns True if verification was completed, False if couldn't handle."""
+    Tries browser-based Gmail first (no App Password needed), falls back to IMAP.
+    Handles both 'enter code' and 'click link' verification types.
+    Returns True if verification was completed, False otherwise."""
     try:
         vis_text = page.evaluate("() => document.body.innerText.toLowerCase().slice(0, 3000)")
     except Exception:
         return False
 
-    # Check if this is a verification page
-    is_verify = (
-        ("verification code" in vis_text or "verify your email" in vis_text or
-         "enter the code" in vis_text or "we sent a code" in vis_text or
-         "one-time" in vis_text)
-        and ("email" in vis_text or "code" in vis_text)
-    )
+    is_verify = any(phrase in vis_text for phrase in [
+        "verification code", "verify your email", "enter the code",
+        "we sent a code", "one-time", "check your email", "sent you an email",
+        "confirm your email", "activate your account", "click the link",
+    ])
+
+    # Oracle HCM OTP page: 6 individual single-digit inputs indicate OTP even without text phrases
+    if not is_verify and "oraclecloud.com" in page.url:
+        try:
+            if page.locator('input[maxlength="1"]').count() >= 6:
+                is_verify = True
+        except Exception:
+            pass
 
     if not is_verify:
         return False
 
-    log("  Detected email verification page — attempting to read code from Gmail...")
-    code = fetch_verification_code()
+    log("  Detected email verification — checking Gmail via browser...")
+
+    # --- Method 1: Browser-based Gmail ---
+    body_text, body_html, gmail_tab = _open_gmail_and_find_email(page, wait_seconds=20)
+    if body_text and body_html:
+        try:
+            # Check for verification link first (Workday, Oracle account activation)
+            link_patterns = [
+                r'href=["\']?(https?://[^"\'>\s]+(?:verif|confirm|activat|reset|token)[^"\'>\s]*)',
+                r'href=["\']?(https?://[^"\'>\s]+workday[^"\'>\s]*)',
+                r'href=["\']?(https?://[^"\'>\s]+oracle[^"\'>\s]*)',
+            ]
+            verify_link = None
+            for pat in link_patterns:
+                m = re.search(pat, body_html, re.I)
+                if m:
+                    verify_link = m.group(1).rstrip('.')
+                    break
+
+            if verify_link:
+                log(f"  email-verify: clicking verification link")
+                verify_tab = page.context.new_page()
+                try:
+                    verify_tab.goto(verify_link, wait_until="domcontentloaded", timeout=20000)
+                    time.sleep(3)
+                    log(f"  email-verify: link opened → {verify_tab.url[:80]}")
+                    # If it redirected to the ATS, bring that page into focus
+                    if gmail_tab:
+                        gmail_tab.close()
+                    verify_tab.close()
+                    return True
+                except Exception as e:
+                    log(f"  email-verify: link error: {e}")
+                    try:
+                        verify_tab.close()
+                    except Exception:
+                        pass
+
+            # Extract numeric code from email body
+            code = None
+            m = re.search(r'(?:verification|security|confirm|your)\s*(?:code|number|pin)\s*(?:is|:)?\s*(\d{4,8})', body_text, re.I)
+            if m:
+                code = m.group(1)
+            if not code:
+                m = re.search(r'\b(\d{6})\b', body_text)
+                if m:
+                    code = m.group(1)
+            if not code:
+                m = re.search(r'\b(\d{4})\b', body_text)
+                if m:
+                    code = m.group(1)
+
+            if gmail_tab:
+                try:
+                    gmail_tab.close()
+                except Exception:
+                    pass
+
+            if code:
+                log(f"  email-verify: found code {code} via browser Gmail")
+            else:
+                log("  email-verify: email found but no code/link extracted")
+
+        except Exception as e:
+            log(f"  email-verify extraction error: {e}")
+            code = None
+            if gmail_tab:
+                try:
+                    gmail_tab.close()
+                except Exception:
+                    pass
+    else:
+        # --- Method 2: IMAP fallback ---
+        log("  email-verify: browser method failed, trying IMAP...")
+        code = fetch_verification_code()
+
     if not code:
+        log("  email-verify: could not retrieve code or link")
         return False
 
-    # Find the code input field and fill it
+    # Oracle HCM: 6 individual single-digit circular inputs
+    try:
+        otp_inputs_loc = page.locator('input[maxlength="1"]')
+        otp_count = otp_inputs_loc.count()
+        if otp_count >= 6 and len(code) >= 6:
+            log(f"  email-verify: Oracle HCM OTP — filling {otp_count} individual digit inputs with code {code}")
+            for i in range(min(otp_count, len(code))):
+                inp = otp_inputs_loc.nth(i)
+                try:
+                    inp.scroll_into_view_if_needed()
+                    inp.click()
+                    time.sleep(0.05)
+                    inp.fill(code[i])
+                    time.sleep(0.08)
+                except Exception as e:
+                    log(f"  email-verify: digit {i} fill error: {e}")
+            time.sleep(0.5)
+            for label in ["Verify", "Submit", "Confirm", "Continue", "Next"]:
+                try:
+                    btn = page.get_by_role("button", name=re.compile(rf"^\s*{re.escape(label)}\s*$", re.I))
+                    if btn.count() > 0 and btn.first.is_visible():
+                        btn.first.click()
+                        log(f"  email-verify: Oracle OTP entered and clicked '{label}'")
+                        time.sleep(3)
+                        return True
+                except Exception:
+                    continue
+            page.keyboard.press("Enter")
+            time.sleep(3)
+            log("  email-verify: Oracle OTP entered and pressed Enter")
+            return True
+    except Exception as e:
+        log(f"  email-verify: Oracle OTP handling error: {e}")
+
+    # Generic single-field path
     code_input = None
     for sel in [
+        'input[autocomplete="one-time-code"]',
         'input[type="text"][name*="code"]',
         'input[type="text"][name*="verify"]',
-        'input[type="tel"]',
         'input[type="number"]',
-        'input[autocomplete="one-time-code"]',
+        'input[type="tel"]',
         'input[name*="otp"]',
         'input[name*="pin"]',
         'input[id*="code"]',
@@ -2516,7 +4758,6 @@ def handle_email_verification(page):
         except Exception:
             continue
 
-    # Fallback: find any empty visible text input
     if not code_input:
         try:
             inputs = page.locator('input[type="text"],input:not([type])')
@@ -2532,7 +4773,6 @@ def handle_email_verification(page):
         log("  email-verify: couldn't find code input field")
         return False
 
-    # Fill and submit
     _fill_with_events(page, code_input, code)
     time.sleep(1)
 
@@ -2583,7 +4823,7 @@ def main():
             row.append("")
         status = row[applied_idx].strip().lower()
 
-        if status == "no" or status.startswith("applied") or status.startswith("manual"):
+        if status == "no" or "applied" in status or status.startswith("manual"):
             continue
 
         url = extract_url(row[0])
