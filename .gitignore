@@ -1,9 +1,30 @@
+# Credentials & personal data
 .env
 service_account.json
+workspace/service_account.json
+workspace/CV.pdf
+workspace/CV.md
+workspace/COVER_LETTER.md
+workspace/APPLICATION_ANSWERS.md
+workspace/screening_answers.json
+
+# Browser profiles
+linkedin-profile/
+company-profile/
+
+# Logs & runtime
+*.log
 bot.log
 monitor.log
+runner.log
+*.pid
 jobs.db
 chat_ids.txt
+sponsor_register.csv
+
+# Python
 __pycache__/
 *.pyc
-sponsor_register.csv
+
+# macOS
+.DS_Store
