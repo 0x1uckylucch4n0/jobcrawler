@@ -1,0 +1,9 @@
+.env
+service_account.json
+bot.log
+monitor.log
+jobs.db
+chat_ids.txt
+__pycache__/
+*.pyc
+sponsor_register.csv
