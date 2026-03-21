@@ -12,7 +12,7 @@ RUN playwright install chromium --with-deps
 # Copy source
 COPY . .
 
-# Data volume for persistent session + workspace files
-VOLUME ["/data"]
+# Ensure data directory exists
+RUN mkdir -p /data
 
 CMD ["python", "scheduler.py"]
