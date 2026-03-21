@@ -7,6 +7,7 @@ Also accepts Telegram commands:
   /status — show last run time + applied count
 """
 import os, time, subprocess, sys, threading, requests
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 
 RUN_INTERVAL_HOURS = float(os.environ.get("RUN_INTERVAL_HOURS", "2"))
@@ -79,7 +80,22 @@ def poll_telegram():
         time.sleep(1)
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def log_message(self, *args):
+        pass
+
+
 if __name__ == "__main__":
+    # Start health check server for Railway
+    port = int(os.environ.get("PORT", 8080))
+    health_server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    threading.Thread(target=health_server.serve_forever, daemon=True).start()
+    print(f"Health server on port {port}", flush=True)
+
     print("JobCrawler scheduler started", flush=True)
     tg(f"🤖 *JobCrawler scheduler online* — running every {RUN_INTERVAL_HOURS}h")
 
