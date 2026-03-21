@@ -20,25 +20,35 @@ from playwright_stealth import Stealth
 # -- Config -------------------------------------------------------------------
 SHEET_ID        = "18-_0J-ImLDrl2Z1Wm0iXskx02X0P9w6_pvG-nAjgkB8"
 TAB_NAME        = "claudebot"
-WORKSPACE       = os.path.expanduser("~/openclaw/apply/workspace")
-PROFILE_DIR     = os.path.expanduser("~/openclaw/apply/company-profile")
+
+_DATA_ROOT      = os.environ.get("DATA_DIR", "")
+if _DATA_ROOT:
+    WORKSPACE   = f"{_DATA_ROOT}/workspace"
+    PROFILE_DIR = f"{_DATA_ROOT}/company-profile"
+    LOG_FILE    = f"{_DATA_ROOT}/runner.log"
+else:
+    WORKSPACE   = os.path.expanduser("~/openclaw/apply/workspace")
+    PROFILE_DIR = os.path.expanduser("~/openclaw/apply/company-profile")
+    LOG_FILE    = os.path.expanduser("~/openclaw/apply/runner.log")
+
 SERVICE_ACCOUNT = f"{WORKSPACE}/service_account.json"
 CV_PATH         = f"{WORKSPACE}/CV.pdf"
 AWS_ACCESS_KEY  = os.environ.get("AWS_ACCESS_KEY", "")
 AWS_SECRET_KEY  = os.environ.get("AWS_SECRET_KEY", "")
-AWS_REGION      = "eu-west-2"
+AWS_REGION      = os.environ.get("AWS_REGION", "eu-west-2")
 CLAUDE_MODEL    = "eu.anthropic.claude-opus-4-6-v1"
 TG_TOKEN        = os.environ.get("TG_TOKEN", "")
 TG_CHAT         = os.environ.get("TG_CHAT", "")
+HEADLESS        = os.environ.get("HEADLESS", "0") == "1"
 # Gmail password for reading verification codes (Oracle HCM, etc.)
-LOG_FILE        = os.path.expanduser("~/openclaw/apply/runner.log")
 WORKDAY_DEFAULT_PASSWORD = os.environ.get("WORKDAY_DEFAULT_PASSWORD", "")  # Standard password for all new Workday accounts
 _workday_passwords = {}  # domain → password used (populated during account creation)
 COL_STATUS      = 6  # Column F
 
-MAX_PAGES       = 25   # max pages per application (Workday multi-page forms can be 15+ pages)
-MAX_RETRIES     = 2    # error-fix retries per page
-MAX_STUCK       = 2    # pages with zero progress before giving up
+MAX_PAGES       = 30   # max pages per application (Workday multi-page forms can be 15+ pages)
+MAX_RETRIES     = 3    # error-fix retries per page
+MAX_STUCK       = 3    # pages with zero progress before giving up
+DRY_RUN         = False  # Set True via --dry-run CLI arg — fills forms but skips Submit
 
 # -- Applicant Profile --------------------------------------------------------
 PROFILE = {
@@ -312,10 +322,13 @@ def record_application(company, role, success, reason=""):
 
 # -- Sheet helpers ------------------------------------------------------------
 def get_sheet():
-    creds = Credentials.from_service_account_file(
-        SERVICE_ACCOUNT,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    sa_json = os.environ.get("GOOGLE_SA_JSON", "")
+    if sa_json:
+        info = json.loads(sa_json)
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT, scopes=scopes)
     return gspread.authorize(creds).open_by_key(SHEET_ID).worksheet(TAB_NAME)
 
 def extract_url(cell):
@@ -437,7 +450,7 @@ EXTRACT_FIELDS_JS = """() => {
     });
 
     // -- Custom dropdowns (Oracle JET, React Select, Workday) --
-    document.querySelectorAll('[role="combobox"],[class*="oj-combobox"],[class*="oj-select"],[class*="css-"][class*="-control"],button[aria-haspopup="listbox"]').forEach(el => {
+    document.querySelectorAll('[role="combobox"],[class*="oj-combobox"],[class*="oj-select"],[class*="oj-select-many"],[class*="css-"][class*="-control"],button[aria-haspopup="listbox"],[data-automation-id*="promptOption"],div[data-automation-id*="multiselectInputContainer"]').forEach(el => {
         if (!el.offsetParent) return;
         const key = 'custom:' + (el.id || el.getAttribute('data-automation-id') || Math.random());
         if (seen.has(key)) return;
@@ -825,37 +838,80 @@ def _find_element(page, selector):
 
 def _fill_with_events(page, el, value):
     """Fill a field and dispatch events for frameworks like Oracle JET, Angular, React.
-    Uses React-compatible native setter + event dispatch to ensure React state updates."""
+    Uses React-compatible native setter + InputEvent dispatch to ensure React state updates.
+    React 16+ listens for InputEvent (not plain Event) on the native event system."""
     try:
         el.scroll_into_view_if_needed()
         time.sleep(0.1)
     except Exception:
         pass
 
-    # Primary strategy: React-compatible fill via native setter + synthetic events.
-    # This works for React, Angular, Vue, Oracle JET, and plain HTML.
+    # Primary strategy: React-compatible fill via native setter + proper InputEvent.
+    # React 16+ uses a native event listener that checks for InputEvent specifically.
+    # We must use the correct prototype setter (HTMLInputElement vs HTMLTextAreaElement).
     try:
         el.evaluate(f"""el => {{
             // Focus the element
             el.focus();
-            // Use native setter to bypass React's synthetic event system
-            const nativeSetter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value'
-            )?.set || Object.getOwnPropertyDescriptor(
-                window.HTMLTextAreaElement.prototype, 'value'
-            )?.set;
+            el.dispatchEvent(new FocusEvent('focus', {{bubbles: true}}));
+
+            // Select all existing text first
+            el.select && el.select();
+
+            // Determine correct prototype setter based on element type
+            const tag = el.tagName.toUpperCase();
+            let nativeSetter;
+            if (tag === 'TEXTAREA') {{
+                nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLTextAreaElement.prototype, 'value'
+                )?.set;
+            }} else {{
+                nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                )?.set;
+            }}
+            // Fallback to generic setter
+            if (!nativeSetter) {{
+                nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                )?.set || Object.getOwnPropertyDescriptor(
+                    window.HTMLTextAreaElement.prototype, 'value'
+                )?.set;
+            }}
+
             if (nativeSetter) {{
                 nativeSetter.call(el, {json.dumps(value)});
             }} else {{
                 el.value = {json.dumps(value)};
             }}
-            // Dispatch events that React/Angular/Vue listen to
-            el.dispatchEvent(new Event('input', {{bubbles: true}}));
+
+            // React 16+ listens for InputEvent (not Event) on the native handler
+            // Angular/Vue also respond to InputEvent
+            el.dispatchEvent(new InputEvent('input', {{
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertText',
+                data: {json.dumps(value)},
+            }}));
             el.dispatchEvent(new Event('change', {{bubbles: true}}));
             el.dispatchEvent(new FocusEvent('blur', {{bubbles: true}}));
+
+            // Trigger React's internal fiber update (React 17+ moved delegation to root)
+            // Also trigger keyup which some frameworks use for validation
+            el.dispatchEvent(new KeyboardEvent('keydown', {{bubbles: true, key: 'Unidentified'}}));
+            el.dispatchEvent(new KeyboardEvent('keyup', {{bubbles: true, key: 'Unidentified'}}));
         }}""")
         page.keyboard.press("Tab")
         time.sleep(0.3)
+
+        # Verify the value actually stuck (React can reset it during re-render)
+        try:
+            actual = el.input_value()
+            if actual != value and value and len(actual) < len(value) // 2:
+                raise Exception("Value didn't stick — try fallback")
+        except Exception:
+            pass
+
         return True
     except Exception:
         pass
@@ -868,16 +924,18 @@ def _fill_with_events(page, el, value):
     except Exception:
         pass
 
-    # Fallback 2: Click + type character by character (works for custom inputs)
+    # Fallback 2: Click + type character by character (works for custom inputs,
+    # Oracle JET, and fields that intercept programmatic value changes)
     try:
         el.click()
-        time.sleep(0.1)
+        time.sleep(0.15)
         page.keyboard.press("Control+a")
         page.keyboard.press("Delete")
-        el.type(value, delay=20)
-        time.sleep(0.1)
+        time.sleep(0.05)
+        el.type(value, delay=25)
+        time.sleep(0.15)
         el.evaluate("""el => {
-            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText'}));
             el.dispatchEvent(new Event('change', {bubbles: true}));
             el.dispatchEvent(new FocusEvent('blur', {bubbles: true}));
         }""")
@@ -887,15 +945,53 @@ def _fill_with_events(page, el, value):
     except Exception:
         pass
 
+    # Fallback 3: For contenteditable divs (rich text editors)
+    try:
+        is_ce = el.evaluate("el => el.isContentEditable")
+        if is_ce:
+            el.click()
+            page.keyboard.press("Control+a")
+            page.keyboard.type(value, delay=20)
+            time.sleep(0.2)
+            return True
+    except Exception:
+        pass
+
     return False
 
 
+_DECLINE_PATTERNS = [
+    "prefer not", "decline to", "choose not", "don't wish", "do not wish",
+    "i don't wish", "i do not wish", "rather not", "not to disclose",
+    "prefer not to disclose", "i prefer not", "no wish", "not wish",
+    "don't want to", "do not want to", "i don't want", "i do not want",
+    "decline to self", "wish to withhold", "not to answer", "not to provide",
+    "prefer to withhold", "not specified", "prefer to not",
+]
+
+
+def _is_decline_value(value):
+    """Return True if value is a 'prefer not to answer / decline' type string."""
+    v = value.lower()
+    return any(p in v for p in _DECLINE_PATTERNS)
+
+
 def _select_native(page, el, value):
-    """Select an option from a native <select> dropdown."""
+    """Select an option from a native <select> dropdown.
+    Fires React-compatible events (focus, input, change) to ensure state sync."""
+    def _fire_events(el_loc):
+        """Fire full event sequence for React/Angular/Vue compatibility."""
+        el_loc.evaluate("""el => {
+            el.dispatchEvent(new Event('focus', {bubbles: true}));
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            el.dispatchEvent(new Event('blur', {bubbles: true}));
+        }""")
+
     try:
         el.scroll_into_view_if_needed()
         el.select_option(label=value)
-        el.evaluate("el => el.dispatchEvent(new Event('change', {bubbles: true}))")
+        _fire_events(el)
         time.sleep(0.3)
         return True
     except Exception:
@@ -906,13 +1002,31 @@ def _select_native(page, el, value):
             index: o.index, text: o.text.trim(), value: o.value
         }))""")
         val_lower = value.lower()
+        # First try exact-ish match, then partial
+        best = None
         for opt in options:
-            if val_lower in opt["text"].lower():
-                el.select_option(index=opt["index"])
-                el.evaluate("el => el.dispatchEvent(new Event('change', {bubbles: true}))")
-                log(f"    -> partial match: '{opt['text']}'")
-                time.sleep(0.3)
-                return True
+            opt_lower = opt["text"].lower()
+            if opt_lower == val_lower:
+                best = opt
+                break
+            if val_lower in opt_lower and best is None:
+                best = opt
+        if best:
+            el.select_option(index=best["index"])
+            _fire_events(el)
+            log(f"    -> native select match: '{best['text']}'")
+            time.sleep(0.3)
+            return True
+        # If value is a "decline/prefer not" type, scan all options for any decline pattern
+        if _is_decline_value(value):
+            for opt in options:
+                opt_lower = opt["text"].lower()
+                if any(p in opt_lower for p in _DECLINE_PATTERNS):
+                    el.select_option(index=opt["index"])
+                    _fire_events(el)
+                    log(f"    -> native select decline-match: '{opt['text']}'")
+                    time.sleep(0.3)
+                    return True
     except Exception:
         pass
     return False
@@ -920,110 +1034,190 @@ def _select_native(page, el, value):
 
 def _custom_dropdown(page, el, search_text, pick_text):
     """Handle custom dropdown: click to open, type to filter, pick option.
-    Works with Workday, Oracle JET, React Select, and other custom dropdown widgets."""
+    Works with Workday, Oracle JET, React Select, and other custom dropdown widgets.
+    Uses wait_for_selector instead of fixed sleeps for reliable timing."""
     try:
         el.scroll_into_view_if_needed()
         time.sleep(0.2)
     except Exception:
         pass
 
-    # Strategy 1: Click the element (or its child arrow/button) to open
-    opened = False
-    for click_target in [el]:
-        try:
-            click_target.click()
-            time.sleep(1.0)
-            # Check if options appeared
-            if page.locator('[role="option"], [role="listbox"] li').count() > 0:
-                opened = True
-                break
-        except Exception:
-            pass
+    # All option selectors we know about (ordered by specificity)
+    OPT_SELECTORS = [
+        '[role="option"]',
+        '[role="listbox"] li',
+        'li[class*="option"]',
+        'div[class*="option"]:not([class*="container"])',
+        '[data-automation-id*="option"]',
+        'ul[role="listbox"] > li',
+        '.css-yk16xz-menu div',  # React Select v2
+        '[class*="menu"] [class*="option"]',  # React Select v3+
+        '.oj-listbox-result',  # Oracle JET
+        '.oj-select-result',  # Oracle JET
+        'li.oj-listbox-result-selectable',  # Oracle JET selectable
+    ]
+    OPT_COMBINED = ', '.join(OPT_SELECTORS)
 
+    def _wait_for_options(timeout_ms=2500):
+        """Wait for dropdown options to appear in DOM."""
+        try:
+            page.wait_for_selector(OPT_COMBINED, state="visible", timeout=timeout_ms)
+            return True
+        except Exception:
+            return False
+
+    def _count_visible_options():
+        try:
+            return page.locator(OPT_COMBINED).count()
+        except Exception:
+            return 0
+
+    # Strategy 1: Click the element directly
+    opened = False
+    try:
+        el.click()
+        opened = _wait_for_options(2500)
+    except Exception:
+        pass
+
+    # Strategy 2: Try clicking child elements (arrow, icon, button)
     if not opened:
-        # Try clicking child elements (arrow, icon, etc.)
-        for child_sel in ['[class*="arrow"]', '[class*="icon"]', 'button', 'span']:
+        for child_sel in ['[class*="arrow"]', '[class*="chevron"]', '[class*="caret"]',
+                          '[class*="icon"]', 'button', 'svg', 'span[class*="indicator"]']:
             try:
                 child = el.locator(child_sel).first
                 if child.is_visible():
                     child.click()
-                    time.sleep(1.0)
-                    if page.locator('[role="option"], [role="listbox"] li').count() > 0:
-                        opened = True
+                    opened = _wait_for_options(2000)
+                    if opened:
                         break
             except Exception:
                 continue
 
+    # Strategy 3: Playwright native click (triggers React synthetic events better)
     if not opened:
-        # Last try: focus + arrow down to open
+        try:
+            el.click(force=True)
+            opened = _wait_for_options(2000)
+        except Exception:
+            pass
+
+    # Strategy 4: Focus + ArrowDown (works for many custom widgets)
+    if not opened:
         try:
             el.focus()
             page.keyboard.press("ArrowDown")
-            time.sleep(0.8)
+            opened = _wait_for_options(2000)
         except Exception:
             pass
 
-    # Collect all option selectors to try
-    opt_selectors = [
-        '[role="option"]',
-        '[role="listbox"] li',
-        'li[class*="option"]',
-        'div[class*="option"]',
-        '[data-automation-id*="option"]',
-        'ul[role="listbox"] > li',
-        '.css-yk16xz-menu div',  # React Select
-    ]
+    # Strategy 5: Focus + Space (some dropdowns open on space)
+    if not opened:
+        try:
+            el.focus()
+            page.keyboard.press("Space")
+            opened = _wait_for_options(1500)
+        except Exception:
+            pass
 
-    pick_lower = (pick_text or search_text or "").lower()
+    pick_lower = (pick_text or search_text or "").lower().strip()
 
-    # If we have search text, type it first to filter
+    # If we have search text, type it to filter options
     if search_text and search_text.strip():
         try:
-            # Clear any existing text first
             page.keyboard.press("Control+a")
             page.keyboard.press("Backspace")
-            time.sleep(0.2)
-            page.keyboard.type(search_text[:20], delay=60)
-            time.sleep(1.2)
+            time.sleep(0.15)
+            # Type search text gradually (some dropdowns filter as you type)
+            page.keyboard.type(search_text[:25], delay=50)
+            # Wait for filtered options to appear
+            time.sleep(0.8)
+            _wait_for_options(2000)
         except Exception:
             pass
 
-    # Try to find and click a matching option
-    for opt_sel in opt_selectors:
-        try:
-            opts = page.locator(opt_sel)
-            count = opts.count()
-            if count == 0:
-                continue
-            for i in range(min(count, 30)):  # Cap at 30 to avoid slow iteration
-                opt = opts.nth(i)
-                try:
-                    if not opt.is_visible():
+    def _try_pick_option():
+        """Try to find and click a matching option across all known selectors."""
+        for opt_sel in OPT_SELECTORS:
+            try:
+                opts = page.locator(opt_sel)
+                count = opts.count()
+                if count == 0:
+                    continue
+                # First pass: exact or substring match
+                for i in range(min(count, 40)):
+                    opt = opts.nth(i)
+                    try:
+                        if not opt.is_visible():
+                            continue
+                    except Exception:
                         continue
-                except Exception:
-                    continue
-                text = opt.inner_text().strip().lower()
-                if not text:
-                    continue
-                if pick_lower and (pick_lower in text or text in pick_lower):
-                    opt.click()
-                    log(f"    -> picked '{opt.inner_text().strip()[:50]}'")
-                    time.sleep(0.4)
-                    return True
-        except Exception:
-            continue
+                    text = opt.inner_text().strip()
+                    text_lower = text.lower()
+                    if not text_lower:
+                        continue
+                    if pick_lower and (pick_lower in text_lower or text_lower in pick_lower
+                                       or pick_lower == text_lower):
+                        opt.click()
+                        log(f"    -> picked '{text[:50]}'")
+                        time.sleep(0.4)
+                        return True
+                # Second pass: fuzzy match — check if all words in pick_lower appear in option
+                if pick_lower and ' ' in pick_lower:
+                    pick_words = pick_lower.split()
+                    for i in range(min(count, 40)):
+                        opt = opts.nth(i)
+                        try:
+                            if not opt.is_visible():
+                                continue
+                        except Exception:
+                            continue
+                        text_lower = opt.inner_text().strip().lower()
+                        if all(w in text_lower for w in pick_words):
+                            opt.click()
+                            log(f"    -> picked (fuzzy) '{opt.inner_text().strip()[:50]}'")
+                            time.sleep(0.4)
+                            return True
+            except Exception:
+                continue
+        return False
 
-    # If typed search didn't find match, clear and try without search
+    if _try_pick_option():
+        return True
+
+    # If typed search didn't find match, clear search and try browsing all options
     if search_text:
         try:
             page.keyboard.press("Control+a")
             page.keyboard.press("Backspace")
-            time.sleep(0.5)
+            time.sleep(0.4)
+            _wait_for_options(1500)
+        except Exception:
+            pass
+        if _try_pick_option():
+            return True
+
+    # Fallback: use keyboard navigation to find option
+    if pick_lower:
+        try:
+            # ArrowDown through options and check highlighted text
+            for _ in range(20):
+                page.keyboard.press("ArrowDown")
+                time.sleep(0.15)
+                focused = page.evaluate("""() => {
+                    const active = document.querySelector('[role="option"][aria-selected="true"], [role="option"].highlighted, [role="option"]:focus, .oj-listbox-result.oj-hover');
+                    return active ? active.innerText.trim().toLowerCase() : '';
+                }""")
+                if focused and (pick_lower in focused or focused in pick_lower):
+                    page.keyboard.press("Enter")
+                    log(f"    -> picked (keyboard) '{focused[:50]}'")
+                    time.sleep(0.4)
+                    return True
         except Exception:
             pass
 
-    # Fallback: pick first visible non-empty option
-    for opt_sel in ['[role="option"]', '[role="listbox"] li', 'li[class*="option"]']:
+    # Last resort: pick first visible non-empty option
+    for opt_sel in OPT_SELECTORS[:5]:
         try:
             opts = page.locator(opt_sel)
             for i in range(min(opts.count(), 15)):
@@ -1031,6 +1225,12 @@ def _custom_dropdown(page, el, search_text, pick_text):
                 try:
                     if opt.is_visible() and opt.inner_text().strip():
                         txt = opt.inner_text().strip()
+                        # Skip placeholder-like options
+                        if txt.lower() in ('select', 'select one', 'choose', 'select...', '--', '',
+                                           'no options', 'no results', 'no matches', 'no results found',
+                                           'no options available', 'loading', 'searching...', 'type to search',
+                                           'please select', 'none selected'):
+                            continue
                         opt.click()
                         log(f"    -> picked first available: '{txt[:50]}'")
                         time.sleep(0.4)
@@ -1393,6 +1593,17 @@ def is_success_page(page):
             "we received your application", "your application is in",
             # Oracle HCM
             "my applications", "under review", "application is under review",
+            # Workday
+            "thank you for your interest", "application was received",
+            "your application has been received", "you have successfully applied",
+            # Lever
+            "thanks for your interest", "your application was submitted",
+            # iCIMS
+            "thank you for submitting", "your submission has been received",
+            # BambooHR / generic
+            "we appreciate your interest", "application confirmation",
+            "your application is complete", "we will review your application",
+            "congratulations", "applied successfully",
         ]
         if any(m in visible_text for m in markers):
             # Oracle HCM: "My Applications" page can also show OTHER jobs, not just success
@@ -1407,7 +1618,10 @@ def is_success_page(page):
             return True
         # Ashby / Workable: URL pattern for confirmation
         url = page.url.lower()
-        if any(p in url for p in ["/confirmation", "/apply/success", "/application/success", "?success=true", "/apply/confirmation"]):
+        if any(p in url for p in ["/confirmation", "/apply/success", "/application/success",
+                                    "?success=true", "/apply/confirmation", "/thank-you",
+                                    "/application-submitted", "/apply/thankyou",
+                                    "/application/confirmation", "/apply/complete"]):
             return True
         # Oracle HCM: /myApplications URL = application list (only success if "under review" visible)
         if "oraclecloud.com" in page.url and "/myapplications" in page.url.lower():
@@ -1420,6 +1634,14 @@ def is_success_page(page):
 
 def click_next_button(page):
     """Find and click the next/continue/submit button. Returns button text or None."""
+    global DRY_RUN
+    # Submit-like labels that should be blocked in dry-run mode
+    SUBMIT_LABELS = {
+        "submit application", "submit", "review and submit", "review & submit",
+        "send application", "confirm", "done", "finish", "complete",
+    }
+    SUBMIT_WD_IDS = {"bottom-navigation-done-button", "jobApply"}
+
     # Workday: data-automation-id buttons first (most reliable)
     for wd_id in [
         "bottom-navigation-next-button",
@@ -1429,6 +1651,9 @@ def click_next_button(page):
     ]:
         btn = page.locator(f'[data-automation-id="{wd_id}"]')
         if btn.count() > 0 and btn.first.is_visible():
+            if DRY_RUN and wd_id in SUBMIT_WD_IDS:
+                log(f"  DRY RUN: would click Workday button '{wd_id}' — skipping")
+                return f"DRY_RUN:{wd_id}"
             try:
                 btn.first.evaluate("el => el.click()")
                 log(f"  -> Clicked Workday button: {wd_id}")
@@ -1453,6 +1678,9 @@ def click_next_button(page):
                 if loc.count() > 0:
                     vis = [loc.nth(i) for i in range(loc.count()) if loc.nth(i).is_visible()]
                     if vis:
+                        if DRY_RUN and label.lower() in SUBMIT_LABELS:
+                            log(f"  DRY RUN: would click '{label}' — skipping")
+                            return f"DRY_RUN:{label}"
                         vis[0].scroll_into_view_if_needed()
                         try:
                             vis[0].click()
@@ -1465,18 +1693,38 @@ def click_next_button(page):
 
     # Last resort: JS search for any forward-looking button
     try:
-        clicked = page.evaluate("""() => {
-            const targets = ['next','continue','submit','apply','save and continue','done','finish','review','sign in','log in','login'];
-            const btns = [...document.querySelectorAll('button,a[role="button"],input[type="submit"]')];
-            for (const t of targets) {
-                const btn = btns.find(b => b.offsetParent && b.innerText.trim().toLowerCase().includes(t));
-                if (btn) { btn.click(); return btn.innerText.trim().slice(0, 30); }
-            }
-            return null;
-        }""")
-        if clicked:
-            log(f"  -> Clicked (JS): '{clicked}'")
-            return clicked
+        if DRY_RUN:
+            # In dry-run, only allow navigation buttons, not submit
+            found = page.evaluate("""() => {
+                const navTargets = ['next','continue','save and continue'];
+                const submitTargets = ['submit','apply','done','finish'];
+                const btns = [...document.querySelectorAll('button,a[role="button"],input[type="submit"]')];
+                for (const t of navTargets) {
+                    const btn = btns.find(b => b.offsetParent && b.innerText.trim().toLowerCase().includes(t));
+                    if (btn) { btn.click(); return btn.innerText.trim().slice(0, 30); }
+                }
+                for (const t of submitTargets) {
+                    const btn = btns.find(b => b.offsetParent && b.innerText.trim().toLowerCase().includes(t));
+                    if (btn) { return 'DRY_RUN:' + btn.innerText.trim().slice(0, 30); }
+                }
+                return null;
+            }""")
+        else:
+            found = page.evaluate("""() => {
+                const targets = ['next','continue','submit','apply','save and continue','done','finish','review','sign in','log in','login'];
+                const btns = [...document.querySelectorAll('button,a[role="button"],input[type="submit"]')];
+                for (const t of targets) {
+                    const btn = btns.find(b => b.offsetParent && b.innerText.trim().toLowerCase().includes(t));
+                    if (btn) { btn.click(); return btn.innerText.trim().slice(0, 30); }
+                }
+                return null;
+            }""")
+        if found:
+            if found.startswith("DRY_RUN:"):
+                log(f"  DRY RUN: would click (JS): '{found[8:]}' — skipping")
+            else:
+                log(f"  -> Clicked (JS): '{found}'")
+            return found
     except Exception:
         pass
 
@@ -1847,6 +2095,99 @@ def _auto_fill_workable_required_radios(page):
         log(f"    workable-radio error: {e}")
 
 
+def _auto_fill_eeo_selects(page):
+    """Auto-fill native <select> EEO/demographic dropdowns (Greenhouse, Lever, etc.).
+    Finds unfilled selects near EEO keyword labels and picks the closest
+    'decline / prefer not to answer' option, or a sensible default."""
+    _EEO_KEYWORDS = [
+        "hispanic", "latino", "race", "ethnicity", "ethnic", "gender",
+        "sex", "sexual orientation", "veteran", "disability", "military",
+        "gender identity", "pronouns",
+    ]
+    _DECLINE = _DECLINE_PATTERNS  # reuse global list
+
+    def _label_for_select(sel_el):
+        """Return the visible label text for a <select> element, or ''."""
+        try:
+            return sel_el.evaluate("""el => {
+                // 1. aria-labelledby
+                const lblId = el.getAttribute('aria-labelledby');
+                if (lblId) {
+                    const l = document.getElementById(lblId);
+                    if (l) return l.innerText.trim();
+                }
+                // 2. aria-label
+                if (el.getAttribute('aria-label')) return el.getAttribute('aria-label');
+                // 3. <label for=id>
+                if (el.id) {
+                    const l = document.querySelector('label[for="' + el.id + '"]');
+                    if (l) return l.innerText.trim();
+                }
+                // 4. walk up for a wrapping label or preceding label sibling
+                let p = el.parentElement;
+                for (let i = 0; i < 6; i++) {
+                    if (!p) break;
+                    const lbl = p.querySelector('label, legend, [class*="label"], [class*="question"]');
+                    if (lbl && lbl.innerText.trim() && !lbl.contains(el)) return lbl.innerText.trim();
+                    p = p.parentElement;
+                }
+                return '';
+            }""")
+        except Exception:
+            return ""
+
+    try:
+        selects = page.locator("select").all()
+    except Exception:
+        return
+
+    for sel in selects:
+        try:
+            if not sel.is_visible():
+                continue
+            # Skip already-filled selects (non-blank, non-placeholder value)
+            current = sel.evaluate("el => el.options[el.selectedIndex]?.text?.trim() || ''")
+            if current and current.lower() not in ("", "select", "please select", "--", "select one"):
+                continue
+            label = _label_for_select(sel).lower()
+            if not any(kw in label for kw in _EEO_KEYWORDS):
+                continue
+            # Get all options
+            options = sel.evaluate("""el => Array.from(el.options).map(o => ({
+                index: o.index, text: o.text.trim(), value: o.value
+            }))""")
+            # Try decline patterns first
+            picked = None
+            for opt in options:
+                if any(p in opt["text"].lower() for p in _DECLINE):
+                    picked = opt
+                    break
+            # Fallback by question type
+            if not picked:
+                if "hispanic" in label or "latino" in label:
+                    for opt in options:
+                        if opt["text"].lower() in ("no", "no, not hispanic or latino",
+                                                   "not hispanic or latino"):
+                            picked = opt
+                            break
+                if not picked and "veteran" in label:
+                    for opt in options:
+                        if "not" in opt["text"].lower() and "veteran" in opt["text"].lower():
+                            picked = opt
+                            break
+                if not picked and "disability" in label:
+                    for opt in options:
+                        if opt["text"].lower() in ("no", "no disability"):
+                            picked = opt
+                            break
+            if picked:
+                sel.evaluate(f"el => {{ el.selectedIndex = {picked['index']}; "
+                             "el.dispatchEvent(new Event('change', {bubbles: true})); }")
+                log(f"    eeo-select: '{picked['text']}' for '{label[:50]}'")
+        except Exception:
+            continue
+
+
 def _auto_fill_oracle_jet_dropdowns(page):
     """Auto-fill Oracle JET custom dropdowns (oj-select-one, oj-combobox-one).
     These are NOT standard <select> elements — they require click-to-open + option click.
@@ -1941,25 +2282,47 @@ def _auto_fill_oracle_jet_dropdowns(page):
                         idx++;
                     }}
                 }}""")
-                time.sleep(0.8)
+
+                # Wait for dropdown to actually open instead of fixed sleep
+                try:
+                    page.wait_for_selector(
+                        'li[role="option"], .oj-listbox-result, .oj-listbox-result-selectable',
+                        state="visible", timeout=3000
+                    )
+                except Exception:
+                    time.sleep(0.8)  # fallback to sleep if wait fails
 
                 # Now look for "Prefer not to" option in the dropdown list
                 prefer_patterns = [
                     "prefer not", "decline to", "choose not", "don't wish",
-                    "do not wish", "rather not", "not to disclose",
+                    "do not wish", "i don't wish", "i do not wish", "rather not",
+                    "not to disclose", "not to answer", "not to provide",
+                    "prefer to withhold", "wish to withhold", "decline to self",
+                    "don't want to", "do not want to", "i don't want",
+                ]
+
+                # Oracle JET option selectors (varies by version)
+                oracle_opt_sels = [
+                    'li[role="option"]',
+                    '.oj-listbox-result',
+                    '.oj-listbox-result-selectable',
+                    'li.oj-select-result',
                 ]
 
                 option_clicked = False
                 for pattern in prefer_patterns:
-                    try:
-                        opt = page.locator(f'li[role="option"]:has-text("{pattern}")').first
-                        if opt.is_visible(timeout=500):
-                            opt.click()
-                            log(f"    oracle-jet: selected '{pattern}...' for '{label[:40]}'")
-                            option_clicked = True
-                            break
-                    except Exception:
-                        continue
+                    for opt_sel in oracle_opt_sels:
+                        try:
+                            opt = page.locator(f'{opt_sel}:has-text("{pattern}")').first
+                            if opt.is_visible(timeout=500):
+                                opt.click()
+                                log(f"    oracle-jet: selected '{pattern}...' for '{label[:40]}'")
+                                option_clicked = True
+                                break
+                        except Exception:
+                            continue
+                    if option_clicked:
+                        break
 
                 if not option_clicked:
                     # For specific EEO questions, try known option texts
@@ -1967,45 +2330,76 @@ def _auto_fill_oracle_jet_dropdowns(page):
                     fallback_options = []
                     if "title" in q or "salutation" in q:
                         fallback_options = ["Ms.", "Ms", "Miss"]
+                    elif "hispanic" in q or "latino" in q:
+                        fallback_options = ["I don't wish to answer", "Prefer not to say", "decline",
+                                            "No", "not hispanic", "prefer not"]
                     elif "race" in q or "ethnic" in q:
-                        fallback_options = ["Two or More", "Other", "Prefer"]
+                        fallback_options = ["I don't wish to answer", "Prefer not to say", "decline",
+                                            "Two or More", "Other", "Prefer"]
                     elif "sexual orientation" in q or "sexual_orientation" in q:
-                        fallback_options = ["Heterosexual", "Straight", "Heterosexual / Straight", "Prefer not to say"]
+                        fallback_options = ["I don't wish to answer", "Prefer not to say",
+                                            "Heterosexual", "Straight", "Heterosexual / Straight"]
                     elif "gender identity" in q or "gender_identity" in q:
-                        fallback_options = ["Female", "Woman", "Prefer not to say"]
+                        fallback_options = ["I don't wish to answer", "Prefer not to say",
+                                            "Female", "Woman"]
                     elif "sex" in q:
-                        fallback_options = ["Female", "Prefer"]
+                        fallback_options = ["I don't wish to answer", "Prefer not to say", "Female"]
                     elif "gender" in q:
-                        fallback_options = ["Woman", "Female", "Prefer"]
+                        fallback_options = ["I don't wish to answer", "Prefer not to say",
+                                            "Woman", "Female"]
                     elif "veteran" in q or "military" in q:
-                        fallback_options = ["not a", "prefer not", "no"]
+                        fallback_options = ["I don't wish to answer", "prefer not", "not a", "no"]
                     elif "disability" in q:
-                        fallback_options = ["don't wish", "prefer not", "no"]
+                        fallback_options = ["I don't wish to answer", "don't wish", "prefer not", "no"]
                     elif "related to" in q or "employee" in q or "relative" in q:
                         fallback_options = ["No", "no"]
                     elif "requirement" in q or "adjustment" in q or "reasonable" in q:
                         fallback_options = ["No", "no"]
 
                     for opt_text in fallback_options:
-                        try:
-                            opt = page.locator(f'li[role="option"]:has-text("{opt_text}")').first
-                            if opt.is_visible(timeout=500):
-                                opt.click()
-                                log(f"    oracle-jet: selected '{opt_text}...' for '{label[:40]}'")
-                                option_clicked = True
-                                break
-                        except Exception:
-                            continue
+                        for opt_sel in oracle_opt_sels:
+                            try:
+                                opt = page.locator(f'{opt_sel}:has-text("{opt_text}")').first
+                                if opt.is_visible(timeout=500):
+                                    opt.click()
+                                    log(f"    oracle-jet: selected '{opt_text}...' for '{label[:40]}'")
+                                    option_clicked = True
+                                    break
+                            except Exception:
+                                continue
+                        if option_clicked:
+                            break
 
                 if not option_clicked:
-                    # Last resort: pick the first option
+                    # Try keyboard navigation as fallback (type to search in combobox)
+                    if fallback_options:
+                        try:
+                            page.keyboard.type(fallback_options[0][:10], delay=80)
+                            time.sleep(0.6)
+                            for opt_sel in oracle_opt_sels:
+                                opt = page.locator(opt_sel).first
+                                if opt.is_visible(timeout=500):
+                                    opt.click()
+                                    log(f"    oracle-jet: selected via typing for '{label[:40]}'")
+                                    option_clicked = True
+                                    break
+                        except Exception:
+                            pass
+
+                if not option_clicked:
+                    # Last resort: pick the first non-placeholder option
                     try:
-                        first_opt = page.locator('li[role="option"]').first
-                        if first_opt.is_visible(timeout=500):
-                            txt = first_opt.inner_text()[:40]
-                            first_opt.click()
-                            log(f"    oracle-jet: selected first option '{txt}' for '{label[:40]}'")
-                        else:
+                        for opt_sel in oracle_opt_sels:
+                            first_opt = page.locator(opt_sel).first
+                            if first_opt.is_visible(timeout=500):
+                                txt = first_opt.inner_text()[:40]
+                                if txt.lower() not in ('select', 'select one', '--', '', 'no options',
+                                                       'no results', 'no matches', 'loading', 'please select'):
+                                    first_opt.click()
+                                    log(f"    oracle-jet: selected first option '{txt}' for '{label[:40]}'")
+                                    option_clicked = True
+                                    break
+                        if not option_clicked:
                             page.keyboard.press("Escape")
                     except Exception:
                         page.keyboard.press("Escape")
@@ -3349,6 +3743,7 @@ def apply_company(page, url, role, company, ws_profile, client):
         _auto_answer_yesno_toggles(page)
         _auto_check_consent(page)
         _auto_fill_workable_required_radios(page)
+        _auto_fill_eeo_selects(page)
         _auto_fill_oracle_jet_dropdowns(page)
         _auto_fill_workday_dropdowns(page)
         _workday_fill_county_region(page)
@@ -3419,24 +3814,31 @@ def apply_company(page, url, role, company, ws_profile, client):
 
         # Quick re-fill pass: React sometimes clears fields during re-render.
         # Re-execute fill actions for any fields that are now empty.
+        # Run twice with a short delay — React may re-render asynchronously.
         if actions:
-            fields_check = extract_page_fields(page)
-            empty_ids = {
-                f["id"] for f in fields_check
-                if f.get("id") and not f.get("value")
-                and f["type"] in ("text", "email", "tel", "textarea")
-                and not f.get("disabled") and not f.get("readonly")
-            }
-            if empty_ids:
+            for refill_round in range(2):
+                if refill_round > 0:
+                    time.sleep(0.8)  # Wait for async re-render
+                fields_check = extract_page_fields(page)
+                empty_ids = {
+                    f["id"] for f in fields_check
+                    if f.get("id") and not f.get("value")
+                    and f["type"] in ("text", "email", "tel", "textarea")
+                    and not f.get("disabled") and not f.get("readonly")
+                }
+                if not empty_ids:
+                    break
                 refills = [
                     a for a in actions
                     if isinstance(a, dict) and a.get("action") == "fill"
                     and any(eid in a.get("selector", "") for eid in empty_ids)
                 ]
                 if refills:
-                    log(f"  Re-filling {len(refills)} fields cleared by React")
+                    log(f"  Re-filling {len(refills)} fields cleared by React (round {refill_round+1})")
                     execute_actions(page, refills)
                     time.sleep(0.5)
+                else:
+                    break
 
         # Verify and retry if errors
         for retry in range(MAX_RETRIES):
@@ -3453,10 +3855,15 @@ def apply_company(page, url, role, company, ws_profile, client):
                 log(f"  Fatal error detected: {errors[0][:100]}")
                 return False, f"blocked: {errors[0][:100]}"
             log(f"  Errors: {errors[:5]} | Empty required: {empty} (retry {retry+1})")
-            # Re-run targeted fixers before asking Claude
+            # Re-run all targeted fixers before asking Claude
+            _auto_fill_eeo_selects(page)
+            _auto_fill_oracle_jet_dropdowns(page)
+            _auto_fill_workday_dropdowns(page)
             _workday_fill_county_region(page)
             _workday_fill_phone_code(page)
             _workday_fill_source_dropdown(page)
+            _auto_answer_yesno_toggles(page)
+            _auto_check_consent(page)
             error_ctx = f"Validation errors: {errors}\nEmpty required fields: {empty}"
             fields_retry = [f for f in extract_page_fields(page) if f.get("id") not in MULTISELECT_IDS]
             fix_actions = analyze_page(
@@ -3471,10 +3878,15 @@ def apply_company(page, url, role, company, ws_profile, client):
         time.sleep(0.5)
         clicked = click_next_button(page)
         if clicked:
+            # In dry-run mode, if we hit a submit button, treat as success without clicking
+            if isinstance(clicked, str) and clicked.startswith("DRY_RUN:"):
+                log(f"  DRY RUN complete — form filled up to submit button")
+                return True, "dry_run_complete"
             time.sleep(4)
             # Re-apply toggles/dropdowns in case validation reset them
             _auto_answer_yesno_toggles(page)
             _auto_check_consent(page)
+            _auto_fill_eeo_selects(page)
             _auto_fill_oracle_jet_dropdowns(page)
             _auto_fill_workday_dropdowns(page)
             _workday_fill_county_region(page)
@@ -3968,6 +4380,24 @@ def _handle_workday_auth_page(page):
         return False
     page_lower = page_text.lower()
 
+    # Check for "Sign in with email" button (appears after Workday account creation redirect)
+    # Must handle this BEFORE checking for auth pages, as this is a special login variant
+    if "sign in with email" in page_lower or "sign in with google" in page_lower:
+        for email_signin_sel in [
+            'a:has-text("Sign in with email")',
+            'button:has-text("Sign in with email")',
+            '[data-automation-id="signInWithEmail"]',
+        ]:
+            try:
+                el = page.locator(email_signin_sel)
+                if el.count() > 0 and el.first.is_visible(timeout=1000):
+                    el.first.click()
+                    log("  Workday auth: clicked 'Sign in with email' (avoiding Google OAuth)")
+                    time.sleep(2)
+                    return True  # Next iteration will handle the email/password sign-in form
+            except Exception:
+                continue
+
     # Only act when we're clearly on an auth page
     is_auth = any(x in page_lower for x in [
         "create account", "already have an account",
@@ -3992,7 +4422,13 @@ def _handle_workday_auth_page(page):
     # Get domain key for state tracking
     domain_match = re.search(r'https?://([^/]+)', page.url)
     domain_key = domain_match.group(1) if domain_match else "workday"
-    state = _workday_auth_state.setdefault(domain_key, {"signin_attempts": 0, "created": False})
+    state = _workday_auth_state.setdefault(domain_key, {"signin_attempts": 0, "created": False, "auth_loops": 0})
+
+    # Guard against infinite auth loops — give up after 8 total auth handler calls
+    state["auth_loops"] = state.get("auth_loops", 0) + 1
+    if state["auth_loops"] > 8:
+        log(f"  Workday auth: giving up after {state['auth_loops']} auth loops on {domain_key}")
+        return False
 
     # Determine page type: Create Account has "verify new password" / "confirm password"
     is_create_account_page = any(x in page_lower for x in [
@@ -4230,6 +4666,9 @@ def _handle_workday_auth_page(page):
 def _workday_fill_create_account(page, domain_key, state):
     """Fill and submit the Workday Create Account form."""
     password = WORKDAY_DEFAULT_PASSWORD
+    if not password:
+        log("  Workday auth: WORKDAY_DEFAULT_PASSWORD not set — cannot create account")
+        return False
     _workday_passwords[domain_key] = password  # Remember for Sign In after verification
 
     try:
@@ -4624,8 +5063,16 @@ def handle_email_verification(page):
 
     log("  Detected email verification — checking Gmail via browser...")
 
-    # --- Method 1: Browser-based Gmail ---
-    body_text, body_html, gmail_tab = _open_gmail_and_find_email(page, wait_seconds=20)
+    # --- Method 1: Browser-based Gmail (with retry — emails take time to arrive) ---
+    body_text, body_html, gmail_tab = None, None, None
+    for email_attempt in range(3):
+        wait_secs = 20 + (email_attempt * 15)  # 20s, 35s, 50s
+        if email_attempt > 0:
+            log(f"  email-verify: retry {email_attempt+1}/3, waiting {wait_secs}s for email...")
+            time.sleep(10)  # Extra wait between retries for email delivery
+        body_text, body_html, gmail_tab = _open_gmail_and_find_email(page, wait_seconds=wait_secs)
+        if body_text or body_html:
+            break
     if body_text and body_html:
         try:
             # Check for verification link first (Workday, Oracle account activation)
@@ -4837,7 +5284,15 @@ def main():
         elif not status and "linkedin.com" not in url.lower():
             pending.append((i, url, title, company))
 
-    log(f"Found {len(pending)} company site jobs")
+    pending = list(reversed(pending))  # bottom-up: start from last row
+    if "--limit" in sys.argv:
+        idx = sys.argv.index("--limit")
+        try:
+            pending = pending[:int(sys.argv[idx + 1])]
+        except (IndexError, ValueError):
+            pass
+
+    log(f"Found {len(pending)} company site jobs (bottom-up)")
     if not pending:
         return
 
@@ -4852,12 +5307,14 @@ def main():
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             PROFILE_DIR,
-            headless=False,
+            headless=HEADLESS,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-session-crashed-bubble",
                 "--hide-crash-restore-bubble",
                 "--no-first-run",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
             ],
             viewport={"width": 1280, "height": 900},
         )
@@ -4936,11 +5393,22 @@ def main():
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1:
-        # Quick test mode: python company_runner.py <url> [title] [company]
-        test_url = sys.argv[1]
-        test_title = sys.argv[2] if len(sys.argv) > 2 else "Test Job"
-        test_company = sys.argv[3] if len(sys.argv) > 3 else "Test Company"
+    # --dry-run flag: fill forms but don't click Submit
+    DRY_RUN = "--dry-run" in sys.argv
+    if DRY_RUN:
+        sys.argv.remove("--dry-run")
+        log("DRY RUN MODE: will fill forms but NOT submit")
+    # Strip --limit N and its value from argv before building positional args
+    _argv = sys.argv[1:]
+    if "--limit" in _argv:
+        _li = _argv.index("--limit")
+        _argv = _argv[:_li] + _argv[_li + 2:]
+    args = [a for a in _argv if not a.startswith("--")]
+    if args:
+        # Quick test mode: python company_runner.py <url> [title] [company] [--dry-run]
+        test_url = args[0]
+        test_title = args[1] if len(args) > 1 else "Test Job"
+        test_company = args[2] if len(args) > 2 else "Test Company"
         log(f"\n{'='*50}")
         log(f"SINGLE URL TEST -- {datetime.now().strftime('%Y-%m-%d %H:%M')}")
         log(f"URL: {test_url}")
