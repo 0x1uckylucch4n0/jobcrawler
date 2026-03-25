@@ -15,7 +15,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 from google.oauth2.service_account import Credentials
 import anthropic
 from playwright.sync_api import sync_playwright
-from playwright_stealth import Stealth
+from playwright_stealth import stealth_sync
 
 # -- Config -------------------------------------------------------------------
 SHEET_ID        = "18-_0J-ImLDrl2Z1Wm0iXskx02X0P9w6_pvG-nAjgkB8"
@@ -1750,7 +1750,7 @@ def handle_new_tabs(page, context):
                 time.sleep(0.5)
             if "linkedin.com" not in new_page.url and new_page.url not in ("about:blank", ""):
                 log(f"  Switched to new tab: {new_page.url}")
-                Stealth().apply_stealth_sync(new_page)
+                stealth_sync(new_page)
                 for old_p in all_pages:
                     if old_p != new_page and not old_p.is_closed():
                         try:
@@ -4233,7 +4233,7 @@ def _workday_click_apply_and_catch_tab(page, context):
         except Exception:
             pass
         log(f"  Workday: Apply opened new tab → {new_page.url[:80]}")
-        Stealth().apply_stealth_sync(new_page)
+        stealth_sync(new_page)
         _workday_apply_clicked.add(current_url)
         try:
             page.close()
@@ -4302,7 +4302,7 @@ def _workday_click_apply_and_catch_tab(page, context):
                 time.sleep(0.5)
             if nt.url not in ("about:blank", "") and "linkedin.com" not in nt.url:
                 log(f"  Workday: Apply opened tab (method 2) → {nt.url[:80]}")
-                Stealth().apply_stealth_sync(nt)
+                stealth_sync(nt)
                 _workday_apply_clicked.add(current_url)
                 try:
                     page.close()
@@ -5325,7 +5325,7 @@ def main():
             except Exception:
                 pass
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        Stealth().apply_stealth_sync(page)
+        stealth_sync(page)
 
         # Check LinkedIn login
         page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
@@ -5432,7 +5432,7 @@ if __name__ == "__main__":
                 viewport={"width": 1280, "height": 900},
             )
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
-            Stealth().apply_stealth_sync(page)
+            stealth_sync(page)
             ok, reason = apply_company(page, test_url, test_title, test_company, ws_profile, client)
             log(f"\nResult: {'APPLIED' if ok else 'FAILED'} -- {reason}")
             ctx.close()

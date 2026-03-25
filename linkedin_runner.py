@@ -7,7 +7,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import anthropic
 from playwright.sync_api import sync_playwright
-from playwright_stealth import Stealth
+from playwright_stealth import stealth_sync
 
 # ── Config ───────────────────────────────────────────────────────────────────────
 SHEET_ID        = "18-_0J-ImLDrl2Z1Wm0iXskx02X0P9w6_pvG-nAjgkB8"
@@ -577,7 +577,7 @@ def main():
             viewport={"width": 1280, "height": 800},
         )
         page = ctx.new_page()
-        Stealth().apply_stealth_sync(page)
+        stealth_sync(page)
 
         page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
         time.sleep(3)
@@ -607,7 +607,7 @@ def main():
                     log("  Page closed — reopening...")
                     try:
                         page = ctx.new_page()
-                        Stealth().apply_stealth_sync(page)
+                        stealth_sync(page)
                     except Exception as reopen_err:
                         log(f"  Could not reopen page: {reopen_err} — stopping.")
                         break
