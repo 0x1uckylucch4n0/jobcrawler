@@ -123,10 +123,18 @@ def _apply_conditional_formatting(spreadsheet, sheet_id: int):
 def _get_sheet():
     global _sheet, _spreadsheet
     if _sheet is None:
-        creds = Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
+        sa_json = os.environ.get("GOOGLE_SA_JSON", "")
+        if sa_json:
+            import json as _json
+            info = _json.loads(sa_json)
+            creds = Credentials.from_service_account_info(
+                info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+            )
+        else:
+            creds = Credentials.from_service_account_file(
+                SERVICE_ACCOUNT_FILE,
+                scopes=["https://www.googleapis.com/auth/spreadsheets"]
+            )
         client = gspread.authorize(creds)
         _spreadsheet = client.open_by_key(SHEET_ID)
 
