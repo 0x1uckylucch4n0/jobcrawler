@@ -4,3 +4,7 @@ pandas
 requests
 python-dotenv
 openpyxl
+gspread==6.1.2
+google-auth==2.38.0
+anthropic==0.49.0
+apscheduler
