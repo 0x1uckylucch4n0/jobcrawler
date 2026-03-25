@@ -1,5 +1,5 @@
 python-telegram-bot==20.7
-jobspy==0.31.0
+python-jobspy>=1.1.0
 pandas
 requests
 python-dotenv
