@@ -202,11 +202,16 @@ def search_jobs(max_results: int = 10, new_only: bool = False) -> list[dict]:
                     site_name=["linkedin", "google"],
                     search_term=term,
                     location=loc["jobspy_location"],
+                    country_indeed=loc.get("country", "UK"),
                     results_wanted=50,
                     hours_old=720,
                     linkedin_fetch_description=False,
                 )
             except Exception as e:
+                if "Invalid country string" in str(e):
+                    # jobspy sometimes returns results from neighboring countries
+                    # (e.g. Liechtenstein for Swiss searches) — skip silently
+                    continue
                 print(f"  Error: {e}")
                 continue
 
